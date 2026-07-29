@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "chictrip": {
+      "title": "去趣行程",
+      "description": "Read, preview, and safely synchronize chicTrip itineraries.",
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs"
+      ],
+      "cwd": ".",
+      "env": {
+        "CHICTRIP_ENABLE_UNDOCUMENTED_WRITES": "0",
+        "CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS": "0"
+      }
+    }
+  }
+}

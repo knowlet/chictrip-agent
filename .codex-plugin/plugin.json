@@ -1,0 +1,27 @@
+{
+  "name": "chictrip-agent",
+  "version": "0.1.0+codex.20260729112612",
+  "description": "Read, plan, and safely synchronize chicTrip itineraries.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "\u53bb\u8da3\u884c\u7a0b\u52a9\u7406",
+    "shortDescription": "\u8b80\u53d6\u3001\u898f\u5283\u4e26\u5b89\u5168\u540c\u6b65\u53bb\u8da3\u884c\u7a0b",
+    "longDescription": "\u8b93 ChatGPT \u6216 Codex \u8b80\u53d6\u53bb\u8da3\u884c\u7a0b\uff0c\u9810\u89bd\u65c5\u904a\u898f\u5283\u5dee\u7570\uff0c\u4e26\u5728\u4f7f\u7528\u8005\u660e\u78ba\u78ba\u8a8d\u5f8c\u5efa\u7acb\u6216\u4fee\u6539\u884c\u7a0b\u3002",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u5217\u51fa\u6211\u7684\u53bb\u8da3\u884c\u7a0b\u4e26\u6458\u8981\u6bcf\u5929\u5b89\u6392",
+      "\u5e6b\u6211\u898f\u5283\u65b0\u884c\u7a0b\uff0c\u5148\u9810\u89bd\u518d\u540c\u6b65\u5230\u53bb\u8da3",
+      "\u4fee\u6539\u9019\u500b\u53bb\u8da3\u884c\u7a0b\uff0c\u986f\u793a\u5dee\u7570\u4e26\u7b49\u6211\u78ba\u8a8d"
+    ]
+  },
+  "apps": "./.app.json",
+  "mcpServers": "./.mcp.json"
+}

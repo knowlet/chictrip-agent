@@ -1,0 +1,13 @@
+interface:
+  display_name: "去趣行程助理"
+  short_description: "讀取、預覽並安全同步去趣行程"
+  default_prompt: "Use $chictrip-itinerary to review my chicTrip plans and preview requested changes before syncing."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "chictrip"
+      description: "Read and safely update chicTrip itineraries"
+
+policy:
+  allow_implicit_invocation: true

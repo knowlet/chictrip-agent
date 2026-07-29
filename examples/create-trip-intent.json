@@ -1,0 +1,22 @@
+{
+  "kind": "create",
+  "desired": {
+    "title": "chictrip-agent 東京測試行程",
+    "startDate": "2026-12-01",
+    "endDate": "2026-12-01",
+    "timezone": "Asia/Tokyo",
+    "destinations": [
+      {
+        "providerLocationKey": "7,7,0",
+        "name": "東京"
+      }
+    ],
+    "trafficType": "Custom",
+    "days": [
+      {
+        "date": "2026-12-01",
+        "items": []
+      }
+    ]
+  }
+}
