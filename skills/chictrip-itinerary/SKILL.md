@@ -35,25 +35,34 @@ ask the user to paste a password, cookie, access token, or refresh token.
    provider write count, and the preview expiration.
 4. If blockers exist, resolve them by making a new intent and preview. Never
    apply a blocked preview.
-5. Ask the user to review the preview and run the returned local approval
-   command themselves. Approval is deliberately unavailable through MCP.
-6. Wait for the CLI to report that the short-lived approval grant was stored
-   locally. The approval secret must never be returned to or requested by the
-   model.
-7. Call `chictrip_apply_trip_change` once with the exact `previewId`,
-   `intentHash`, and one fresh UUID idempotency key. The server loads and
-   atomically consumes the local approval grant.
-8. Treat only `applied` or `already_applied` with verified reconciliation as
+5. Determine the active approval mode from the apply tool's title, description,
+   and preview summary:
+   - In **Chat host approval** mode, the apply tool says that one approved
+     destructive tool call is the human approval. Call
+     `chictrip_apply_trip_change` after presenting the preview. The Chat host
+     will ask the user to allow that exact tool call. Do not send the user back
+     to a computer or ask them to run a CLI approval command.
+   - In **local CLI approval** mode, ask the user to run the preview's local
+     approval command and wait until the CLI reports that the short-lived grant
+     was stored.
+6. Call `chictrip_apply_trip_change` once with the exact `previewId`,
+   `intentHash`, and one fresh UUID idempotency key. In Chat host approval mode,
+   the server creates and immediately consumes a short-lived grant bound to the
+   preview after the user approves the tool call. In local CLI mode, it consumes
+   the grant previously stored by the CLI. Approval secrets never pass through
+   MCP.
+7. Treat only `applied` or `already_applied` with verified reconciliation as
    complete. Report `conflict`, `partial`, `indeterminate`, or `failed` as
    incomplete, and do not retry blindly.
-9. Call `chictrip_get_trip` after a successful update when the user needs the
+8. Call `chictrip_get_trip` after a successful update when the user needs the
    final itinerary rendered. For uncertain outcomes, call
    `chictrip_get_change_status`; it never retries a write.
 
 ## Preserve safety boundaries
 
-- Never call apply based only on an earlier conversational confirmation. The
-  interactive CLI must have recorded the local approval grant.
+- Never treat ordinary conversational consent as write approval. Approval must
+  be either the Chat host's explicit confirmation for the destructive apply
+  tool call or a local CLI grant, according to the active MCP entrypoint.
 - A preview gets at most one provider write attempt. Never generate a new
   idempotency key to retry a preview after `partial` or `indeterminate`.
 - Never reuse an idempotency key for a different intent.
