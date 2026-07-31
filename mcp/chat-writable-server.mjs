@@ -2930,7 +2930,7 @@ var require_compile = __commonJS((exports) => {
     const schOrFunc = root.refs[ref];
     if (schOrFunc)
       return schOrFunc;
-    let _sch = resolve.call(this, root, ref);
+    let _sch = resolve2.call(this, root, ref);
     if (_sch === undefined) {
       const schema = (_a3 = root.localRefs) === null || _a3 === undefined ? undefined : _a3[ref];
       const { schemaId } = this.opts;
@@ -2957,7 +2957,7 @@ var require_compile = __commonJS((exports) => {
   function sameSchemaEnv(s1, s2) {
     return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
   }
-  function resolve(root, ref) {
+  function resolve2(root, ref) {
     let sch;
     while (typeof (sch = this.refs[ref]) == "string")
       ref = sch;
@@ -3543,7 +3543,7 @@ var require_fast_uri = __commonJS((exports, module) => {
     }
     return uri;
   }
-  function resolve(baseURI, relativeURI, options) {
+  function resolve2(baseURI, relativeURI, options) {
     const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
     const resolved = resolveComponent(parse6(baseURI, schemelessOptions), parse6(relativeURI, schemelessOptions), schemelessOptions, true);
     schemelessOptions.skipEscape = true;
@@ -3808,7 +3808,7 @@ var require_fast_uri = __commonJS((exports, module) => {
   var fastUri = {
     SCHEMES,
     normalize,
-    resolve,
+    resolve: resolve2,
     resolveComponent,
     equal,
     serialize,
@@ -21821,6 +21821,2494 @@ class StdioServerTransport {
   }
 }
 
+// src/config.ts
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+function envFlag(value) {
+  return value === "1" || value?.toLowerCase() === "true";
+}
+function loadConfig(env = process.env) {
+  const stateDir = resolve(env.CHICTRIP_STATE_DIR ?? join(homedir(), ".local", "share", "chictrip-agent"));
+  return {
+    stateDir,
+    browserProfileDir: resolve(env.CHICTRIP_BROWSER_PROFILE_DIR ?? join(stateDir, "browser-profile")),
+    browserChannel: env.CHICTRIP_BROWSER_CHANNEL ?? "chrome",
+    enableUndocumentedWrites: envFlag(env.CHICTRIP_ENABLE_UNDOCUMENTED_WRITES),
+    enableExperimentalItemAdds: envFlag(env.CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS),
+    previewTtlMs: 15 * 60000,
+    approvalTtlMs: 5 * 60000,
+    apiBaseUrl: "https://api.chictrip.com.tw/",
+    providerClientVersion: env.CHICTRIP_PROVIDER_CLIENT_VERSION ?? "2.0.38",
+    siteUrl: "https://www.chictrip.com.tw/landing",
+    httpHost: env.CHICTRIP_MCP_HOST ?? "127.0.0.1",
+    httpPort: Number.parseInt(env.CHICTRIP_MCP_PORT ?? "3333", 10),
+    ...env.CHICTRIP_MCP_BEARER_TOKEN ? { httpBearerToken: env.CHICTRIP_MCP_BEARER_TOKEN } : {}
+  };
+}
+
+// src/auth/browser-session.ts
+import { chmod, mkdir } from "node:fs/promises";
+import {
+  chromium
+} from "playwright-core";
+
+// src/domain/errors.ts
+class AppError extends Error {
+  code;
+  retryable;
+  details;
+  constructor(code, message, options = {}) {
+    super(message, { cause: options.cause });
+    this.name = "AppError";
+    this.code = code;
+    this.retryable = options.retryable ?? false;
+    this.details = options.details;
+  }
+}
+
+// src/auth/browser-session.ts
+async function readBrowserAuthStatusInPage() {
+  const accessToken = window.localStorage.getItem("accessToken");
+  const memberId = window.localStorage.getItem("memberId");
+  if (!accessToken || !memberId)
+    return { authenticated: false };
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3 || !parts[1])
+      return { authenticated: false };
+    const encoded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+    const payload = JSON.parse(window.atob(padded));
+    if (String(payload.sub ?? "") !== memberId) {
+      return { authenticated: false };
+    }
+  } catch {
+    return { authenticated: false };
+  }
+  const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(memberId));
+  if (window.localStorage.getItem("memberId") !== memberId || window.localStorage.getItem("accessToken") !== accessToken) {
+    return { authenticated: false };
+  }
+  const accountRefHash = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return { authenticated: true, accountRefHash };
+}
+
+class BrowserSession {
+  config;
+  operationTail = Promise.resolve();
+  constructor(config2) {
+    this.config = config2;
+  }
+  async status() {
+    return this.withPage(true, (page) => this.readAuthStatus(page));
+  }
+  async login(options = {}) {
+    const timeoutMs = options.timeoutMs ?? 10 * 60000;
+    return this.withPage(false, async (page, context) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const candidates = context.pages().filter((candidate) => !candidate.isClosed() && candidate.url().startsWith("https://www.chictrip.com.tw/"));
+        if (candidates.length === 0 && !page.isClosed() && page.url().startsWith("https://www.chictrip.com.tw/")) {
+          candidates.push(page);
+        }
+        for (const candidate of candidates) {
+          try {
+            const status = await this.readAuthStatus(candidate);
+            if (status.authenticated)
+              return status;
+          } catch (error51) {
+            if (!this.isTransientNavigationError(error51))
+              throw error51;
+          }
+        }
+        await new Promise((resolve2) => setTimeout(resolve2, 1000));
+      }
+      throw new AppError("AUTH_REQUIRED", "Timed out waiting for chicTrip login. Run the login command again.");
+    });
+  }
+  async withAuthenticatedPage(callback) {
+    return this.withPage(true, async (page) => {
+      const status = await this.readAuthStatus(page);
+      if (!status.authenticated) {
+        throw new AppError("AUTH_REQUIRED", "chicTrip login is required. Run `chictrip auth login` locally first.");
+      }
+      return callback(page);
+    });
+  }
+  async withPage(headless, callback) {
+    const previous = this.operationTail;
+    let release;
+    this.operationTail = new Promise((resolve2) => {
+      release = resolve2;
+    });
+    await previous;
+    try {
+      return await this.withExclusivePage(headless, callback);
+    } finally {
+      release();
+    }
+  }
+  async withExclusivePage(headless, callback) {
+    await mkdir(this.config.browserProfileDir, { recursive: true, mode: 448 });
+    await chmod(this.config.browserProfileDir, 448);
+    let context;
+    try {
+      context = await chromium.launchPersistentContext(this.config.browserProfileDir, {
+        channel: this.config.browserChannel,
+        headless,
+        viewport: { width: 1280, height: 900 }
+      });
+    } catch (error51) {
+      throw new AppError("AUTH_REQUIRED", `Unable to launch the dedicated chicTrip browser profile with channel "${this.config.browserChannel}".`, {
+        cause: error51,
+        details: {
+          hint: "Set CHICTRIP_BROWSER_CHANNEL to an installed Playwright browser channel, such as chrome or msedge."
+        }
+      });
+    }
+    try {
+      const existing = context.pages()[0];
+      const page = existing ?? await context.newPage();
+      if (!page.url().startsWith("https://www.chictrip.com.tw/")) {
+        await page.goto(this.config.siteUrl, { waitUntil: "domcontentloaded" });
+      }
+      return await callback(page, context);
+    } finally {
+      await context.close();
+    }
+  }
+  async readAuthStatus(page) {
+    return page.evaluate(readBrowserAuthStatusInPage);
+  }
+  isTransientNavigationError(error51) {
+    const message = error51 instanceof Error ? error51.message : String(error51);
+    return message.includes("Execution context was destroyed") || message.includes("Cannot find context with specified id") || message.includes("Target page, context or browser has been closed");
+  }
+}
+
+// src/provider/browser-api.ts
+var ALLOWED_ENDPOINTS = new Set([
+  "/Location/SearchV2",
+  "/PoiSearch/SearchByKeyword",
+  "/TravelSchedule/GetMyAndCollaboration",
+  "/TravelSchedule/GetSystemCoverList",
+  "/TravelScheduleUserLabel/Get",
+  "/TravelSchedule/AddV2",
+  "/TravelSchedule/UpdateV3",
+  "/TravelScheduleDetail/Get",
+  "/TravelScheduleDetail/GetAddWhere",
+  "/TravelScheduleDetail/Add",
+  "/TravelScheduleDetail/GetEditInfo",
+  "/TravelScheduleDetail/Update",
+  "/TravelScheduleDetail/Delete",
+  "/TravelScheduleDetail/Sort",
+  "/TravelScheduleDetail/VerifyUpdateTime"
+]);
+function serializeProviderEntries(values) {
+  const output = [];
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined || value === null)
+      continue;
+    const isArray = Array.isArray(value);
+    const entries = isArray ? value : [value];
+    const wireKey = isArray ? `${key}[]` : key;
+    for (const entry of entries) {
+      output.push([
+        wireKey,
+        typeof entry === "object" && entry !== null ? JSON.stringify(entry) : String(entry)
+      ]);
+    }
+  }
+  return output;
+}
+async function requestInBrowserPage(input) {
+  const unauthorized = () => ({
+    httpStatus: 401,
+    envelope: { apiStatus: "003", data: null, message: null }
+  });
+  const accountMismatch = () => ({
+    httpStatus: 409,
+    accountMismatch: true,
+    envelope: { apiStatus: "", data: null, message: null }
+  });
+  const tokenSubject = (accessToken) => {
+    try {
+      const parts = accessToken.split(".");
+      if (parts.length !== 3 || !parts[1])
+        return;
+      const encoded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+      const payload = JSON.parse(window.atob(padded));
+      return payload.sub === undefined ? undefined : String(payload.sub);
+    } catch {
+      return;
+    }
+  };
+  const captureCredentials = () => {
+    const memberId = window.localStorage.getItem("memberId");
+    const accessToken = window.localStorage.getItem("accessToken");
+    if (!memberId || !accessToken)
+      return;
+    return {
+      memberId,
+      accessToken,
+      refreshToken: window.localStorage.getItem("refreshToken")
+    };
+  };
+  const snapshotIsCurrent = (snapshot2) => window.localStorage.getItem("memberId") === snapshot2.memberId && window.localStorage.getItem("accessToken") === snapshot2.accessToken && window.localStorage.getItem("refreshToken") === snapshot2.refreshToken;
+  const credentialsMatch = async (snapshot2) => {
+    if (tokenSubject(snapshot2.accessToken) !== snapshot2.memberId)
+      return false;
+    if (input.expectedAccountRefHash) {
+      const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(snapshot2.memberId));
+      const actual = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      if (actual !== input.expectedAccountRefHash)
+        return false;
+    }
+    return snapshotIsCurrent(snapshot2);
+  };
+  const perform = async (accessToken) => {
+    const url2 = new URL(input.path, input.apiBaseUrl);
+    if (input.queryEntries) {
+      for (const [key, value] of input.queryEntries) {
+        url2.searchParams.append(key, value);
+      }
+    }
+    const headers = new Headers({
+      Authorization: `Bearer ${accessToken}`,
+      osType: "web",
+      language: input.language ?? "zhtw",
+      version: input.providerClientVersion
+    });
+    let body;
+    if (input.body || input.bodyEntries) {
+      if (input.bodyEncoding === "form") {
+        const form = new URLSearchParams;
+        for (const [key, value] of input.bodyEntries ?? []) {
+          form.append(key, value);
+        }
+        body = form;
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+      } else if (input.bodyEncoding === "json") {
+        body = JSON.stringify(input.body);
+        headers.set("Content-Type", "application/json");
+      } else {
+        const form = new FormData;
+        for (const [key, value] of input.bodyEntries ?? []) {
+          form.append(key, value);
+        }
+        body = form;
+      }
+    }
+    const response = await window.fetch(url2, {
+      method: input.method,
+      headers,
+      ...body ? { body } : {}
+    });
+    const raw = await response.json();
+    const apiStatus = String(raw.apiStatus ?? raw.ApiStatus ?? "");
+    return {
+      httpStatus: response.status,
+      envelope: {
+        apiStatus,
+        data: raw.data,
+        message: typeof raw.message === "string" ? raw.message : null
+      }
+    };
+  };
+  const snapshot = captureCredentials();
+  if (!snapshot)
+    return unauthorized();
+  if (!await credentialsMatch(snapshot)) {
+    return input.expectedAccountRefHash ? accountMismatch() : unauthorized();
+  }
+  let result = await perform(snapshot.accessToken);
+  if (result.envelope.apiStatus !== "003" || !snapshot.refreshToken) {
+    return result;
+  }
+  const refreshBody = new FormData;
+  refreshBody.append("refreshToken", snapshot.refreshToken);
+  refreshBody.append("memberId", snapshot.memberId);
+  const refreshResponse = await window.fetch(new URL("/Token/Refresh", input.apiBaseUrl), {
+    method: "POST",
+    headers: {
+      osType: "web",
+      language: "zhtw",
+      version: input.providerClientVersion
+    },
+    body: refreshBody
+  });
+  const refreshRaw = await refreshResponse.json();
+  const refreshStatus = String(refreshRaw.apiStatus ?? refreshRaw.ApiStatus ?? "");
+  const refreshData = typeof refreshRaw.data === "object" && refreshRaw.data !== null ? refreshRaw.data : {};
+  if (refreshStatus !== "001" || typeof refreshData.accessToken !== "string") {
+    return result;
+  }
+  const refreshedAccessToken = refreshData.accessToken;
+  const refreshedMemberId = typeof refreshData.memberId === "string" ? refreshData.memberId : snapshot.memberId;
+  if (refreshedMemberId !== snapshot.memberId || tokenSubject(refreshedAccessToken) !== snapshot.memberId || !snapshotIsCurrent(snapshot)) {
+    return input.expectedAccountRefHash ? accountMismatch() : unauthorized();
+  }
+  window.localStorage.setItem("accessToken", refreshedAccessToken);
+  if (typeof refreshData.refreshToken === "string") {
+    window.localStorage.setItem("refreshToken", refreshData.refreshToken);
+  }
+  window.localStorage.setItem("memberId", refreshedMemberId);
+  result = await perform(refreshedAccessToken);
+  return result;
+}
+
+class BrowserApiClient {
+  session;
+  config;
+  constructor(session, config2) {
+    this.session = session;
+    this.config = config2;
+  }
+  async request(request) {
+    if (!ALLOWED_ENDPOINTS.has(request.path)) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", `Provider endpoint is not allowlisted: ${request.path}`);
+    }
+    let pageEvaluationStarted = false;
+    let result;
+    try {
+      result = await this.session.withAuthenticatedPage((page) => {
+        pageEvaluationStarted = true;
+        return this.requestInPage(page, {
+          apiBaseUrl: this.config.apiBaseUrl,
+          providerClientVersion: this.config.providerClientVersion,
+          method: request.method,
+          path: request.path,
+          ...request.expectedAccountRefHash ? { expectedAccountRefHash: request.expectedAccountRefHash } : {},
+          ...request.language ? { language: request.language } : {},
+          ...request.query ? { queryEntries: serializeProviderEntries(request.query) } : {},
+          ...request.body && request.bodyEncoding === "json" ? { body: request.body } : request.body ? { bodyEntries: serializeProviderEntries(request.body) } : {},
+          ...request.bodyEncoding ? { bodyEncoding: request.bodyEncoding } : {}
+        });
+      });
+    } catch (error51) {
+      if (request.method !== "GET" && pageEvaluationStarted) {
+        throw new AppError("PROVIDER_INDETERMINATE", "A chicTrip mutation may have been sent, but no parseable provider response was received.", { cause: error51 });
+      }
+      throw error51;
+    }
+    if (result.accountMismatch) {
+      throw new AppError("APPROVAL_INVALID", "The authenticated chicTrip account changed before the provider request.");
+    }
+    const accepted = request.acceptedStatuses ?? ["001"];
+    if (!accepted.includes(result.envelope.apiStatus)) {
+      if (result.envelope.apiStatus === "003") {
+        throw new AppError("AUTH_REQUIRED", "The chicTrip browser session is no longer authenticated.");
+      }
+      if (result.envelope.apiStatus === "004") {
+        throw new AppError("CONFLICT", "chicTrip reports a newer itinerary revision.", {
+          details: { providerStatus: result.envelope.apiStatus }
+        });
+      }
+      if (result.envelope.apiStatus === "006") {
+        throw new AppError("CONFLICT", "This account no longer has permission to edit the itinerary.", { details: { providerStatus: result.envelope.apiStatus } });
+      }
+      throw new AppError("PROVIDER_ERROR", result.envelope.message || `chicTrip returned status ${result.envelope.apiStatus}.`, {
+        retryable: result.httpStatus >= 500,
+        details: {
+          providerStatus: result.envelope.apiStatus,
+          httpStatus: result.httpStatus
+        }
+      });
+    }
+    return result.envelope;
+  }
+  async requestInPage(page, request) {
+    return page.evaluate(requestInBrowserPage, request);
+  }
+}
+
+// src/domain/schemas.ts
+var IsoDateSchema = exports_external.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected a date in YYYY-MM-DD format.").refine((value) => {
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+}, "Expected a real calendar date.");
+var IsoDateTimeSchema = exports_external.iso.datetime({ offset: true });
+var TripRevisionSchema = exports_external.object({
+  providerVersion: exports_external.string().optional(),
+  contentHash: exports_external.string().min(16),
+  readAt: IsoDateTimeSchema
+});
+var DestinationSchema = exports_external.object({
+  providerLocationKey: exports_external.string().min(1),
+  name: exports_external.string().min(1).max(120)
+});
+var PlaceRefSchema = exports_external.object({
+  providerPlaceId: exports_external.string().min(1),
+  name: exports_external.string().min(1).max(200),
+  latitude: exports_external.number().finite().optional(),
+  longitude: exports_external.number().finite().optional(),
+  coverMediaId: exports_external.string().min(1).optional()
+});
+var TripItemSchema = exports_external.object({
+  id: exports_external.string().optional(),
+  place: PlaceRefSchema,
+  startsAt: IsoDateTimeSchema.optional(),
+  durationMinutes: exports_external.number().int().min(0).max(1440).optional(),
+  note: exports_external.string().max(2000).optional(),
+  categoryId: exports_external.string().min(1).optional()
+});
+var TripDaySchema = exports_external.object({
+  date: IsoDateSchema,
+  items: exports_external.array(TripItemSchema).max(80)
+});
+var TrafficTypeSchema = exports_external.enum([
+  "Walking",
+  "Driving",
+  "Transit",
+  "TwoWheeler",
+  "Custom"
+]);
+var TripDraftSchema = exports_external.object({
+  title: exports_external.string().trim().min(1).max(100),
+  startDate: IsoDateSchema,
+  endDate: IsoDateSchema,
+  timezone: exports_external.string().default("Asia/Taipei"),
+  destinations: exports_external.array(DestinationSchema).min(1).max(20),
+  trafficType: TrafficTypeSchema.default("Custom"),
+  days: exports_external.array(TripDaySchema).min(1).max(60)
+}).superRefine((draft, context) => {
+  const start = Date.parse(`${draft.startDate}T00:00:00Z`);
+  const end = Date.parse(`${draft.endDate}T00:00:00Z`);
+  if (end < start) {
+    context.addIssue({
+      code: "custom",
+      path: ["endDate"],
+      message: "endDate must not be earlier than startDate."
+    });
+  }
+  const expectedDays = Math.floor((end - start) / 86400000) + 1;
+  if (expectedDays > 60) {
+    context.addIssue({
+      code: "custom",
+      path: ["endDate"],
+      message: "chicTrip itineraries are limited to 60 days."
+    });
+  }
+  const uniqueDates = new Set(draft.days.map((day) => day.date));
+  if (uniqueDates.size !== draft.days.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["days"],
+      message: "Each itinerary day must have a unique date."
+    });
+  }
+  if (Number.isFinite(expectedDays) && expectedDays > 0) {
+    if (draft.days.length !== expectedDays) {
+      context.addIssue({
+        code: "custom",
+        path: ["days"],
+        message: `days must contain exactly one entry for each trip date (${expectedDays} total).`
+      });
+    }
+    for (let offset = 0;offset < expectedDays; offset += 1) {
+      const date5 = new Date(start + offset * 86400000).toISOString().slice(0, 10);
+      if (!uniqueDates.has(date5)) {
+        context.addIssue({
+          code: "custom",
+          path: ["days"],
+          message: `Missing itinerary day: ${date5}`
+        });
+      }
+      if (draft.days[offset]?.date !== date5) {
+        context.addIssue({
+          code: "custom",
+          path: ["days", offset, "date"],
+          message: `Itinerary days must be ordered chronologically; expected ${date5}.`
+        });
+      }
+    }
+  }
+  for (const [index, day] of draft.days.entries()) {
+    if (day.date < draft.startDate || day.date > draft.endDate) {
+      context.addIssue({
+        code: "custom",
+        path: ["days", index, "date"],
+        message: "Itinerary day is outside the trip date range."
+      });
+    }
+  }
+});
+var TripSummarySchema = exports_external.object({
+  id: exports_external.string(),
+  title: exports_external.string(),
+  startDate: IsoDateSchema,
+  endDate: IsoDateSchema,
+  ownership: exports_external.enum(["owned", "collaborating"]),
+  permission: exports_external.enum(["owner", "editor", "viewer", "unknown"]),
+  destinationNames: exports_external.array(exports_external.string()),
+  providerVersion: exports_external.string().optional()
+});
+var TripRecordSchema = TripDraftSchema.extend({
+  id: exports_external.string(),
+  ownership: exports_external.enum(["owned", "collaborating"]),
+  permission: exports_external.enum(["owner", "editor", "viewer", "unknown"]),
+  revision: TripRevisionSchema
+});
+var SetTripFieldsOperationSchema = exports_external.object({
+  op: exports_external.literal("set_trip_fields"),
+  fields: exports_external.object({
+    title: exports_external.string().trim().min(1).max(100).optional(),
+    startDate: IsoDateSchema.optional(),
+    endDate: IsoDateSchema.optional(),
+    destinations: exports_external.array(DestinationSchema).min(1).max(20).optional(),
+    trafficType: TrafficTypeSchema.optional()
+  }).refine((fields) => Object.keys(fields).length > 0, "At least one field is required.")
+});
+var AddItemOperationSchema = exports_external.object({
+  op: exports_external.literal("add_item"),
+  date: IsoDateSchema,
+  item: TripItemSchema.omit({ id: true }),
+  afterItemId: exports_external.string().optional()
+});
+var UpdateItemOperationSchema = exports_external.object({
+  op: exports_external.literal("update_item"),
+  itemId: exports_external.string().min(1),
+  fields: exports_external.object({
+    name: exports_external.string().min(1).max(200).optional(),
+    startsAt: IsoDateTimeSchema.nullable().optional(),
+    durationMinutes: exports_external.number().int().min(0).max(1440).optional(),
+    note: exports_external.string().max(2000).nullable().optional(),
+    categoryId: exports_external.string().min(1).nullable().optional()
+  }).refine((fields) => Object.keys(fields).length > 0, "At least one field is required.")
+});
+var MoveItemOperationSchema = exports_external.object({
+  op: exports_external.literal("move_item"),
+  itemId: exports_external.string().min(1),
+  toDate: IsoDateSchema,
+  afterItemId: exports_external.string().optional()
+});
+var RemoveItemOperationSchema = exports_external.object({
+  op: exports_external.literal("remove_item"),
+  itemId: exports_external.string().min(1)
+});
+var TripPatchOperationSchema = exports_external.discriminatedUnion("op", [
+  SetTripFieldsOperationSchema,
+  AddItemOperationSchema,
+  UpdateItemOperationSchema,
+  MoveItemOperationSchema,
+  RemoveItemOperationSchema
+]);
+var CreateTripChangeIntentSchema = exports_external.object({
+  kind: exports_external.literal("create"),
+  desired: TripDraftSchema
+});
+var UpdateTripChangeIntentSchema = exports_external.object({
+  kind: exports_external.literal("update"),
+  tripId: exports_external.string().min(1),
+  baseRevision: TripRevisionSchema,
+  operations: exports_external.array(TripPatchOperationSchema).min(1).max(200)
+});
+var TripChangeIntentSchema = exports_external.discriminatedUnion("kind", [
+  CreateTripChangeIntentSchema,
+  UpdateTripChangeIntentSchema
+]);
+var ApplyTripChangeInputSchema = exports_external.object({
+  previewId: exports_external.uuid(),
+  intentHash: exports_external.string().min(16),
+  idempotencyKey: exports_external.uuid()
+});
+var ListTripsInputSchema = exports_external.object({
+  scope: exports_external.enum(["all", "owned", "collaborating"]).default("all"),
+  limit: exports_external.number().int().min(1).max(100).default(50)
+});
+var SearchPlacesInputSchema = exports_external.object({
+  query: exports_external.string().trim().min(1).max(200),
+  centerLatitude: exports_external.number().finite().min(-90).max(90).optional(),
+  centerLongitude: exports_external.number().finite().min(-180).max(180).optional(),
+  limit: exports_external.number().int().min(1).max(30).default(10)
+});
+var SearchDestinationsInputSchema = exports_external.object({
+  query: exports_external.string().trim().min(1).max(100),
+  limit: exports_external.number().int().min(1).max(30).default(10)
+});
+
+// src/domain/canonical.ts
+import { createHash } from "node:crypto";
+function canonicalize(value) {
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map(canonicalize).join(",")}]`;
+  const object2 = value;
+  return `{${Object.keys(object2).filter((key) => object2[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(object2[key])}`).join(",")}}`;
+}
+function sha256(value) {
+  return createHash("sha256").update(canonicalize(value)).digest("hex");
+}
+function floatingDateTime(value) {
+  const match = value.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+  return match?.[1] && match[2] ? `${match[1]}T${match[2]}+00:00` : value;
+}
+function tripContent(trip) {
+  return {
+    title: trip.title,
+    startDate: trip.startDate,
+    endDate: trip.endDate,
+    timezone: "provider-floating-local-time",
+    destinations: trip.destinations.map((destination) => ({
+      providerLocationKey: destination.providerLocationKey,
+      name: ""
+    })).sort((left, right) => left.providerLocationKey.localeCompare(right.providerLocationKey)),
+    trafficType: trip.trafficType,
+    days: trip.days.map((day) => ({
+      date: day.date,
+      items: day.items.map((item) => ({
+        place: {
+          providerPlaceId: item.place.providerPlaceId,
+          name: item.place.name,
+          ...item.place.coverMediaId ? { coverMediaId: item.place.coverMediaId } : {}
+        },
+        ...item.startsAt ? {
+          startsAt: floatingDateTime(item.startsAt)
+        } : {},
+        durationMinutes: item.durationMinutes ?? 0,
+        ...item.note ? { note: item.note } : {},
+        ...item.categoryId ? { categoryId: item.categoryId } : {}
+      }))
+    })).sort((left, right) => left.date.localeCompare(right.date))
+  };
+}
+function tripContentHash(trip) {
+  return sha256(tripContent(trip));
+}
+function tripMatchesDesired(actual, desired) {
+  const actualContent = tripContent(actual);
+  const desiredContent = tripContent(desired);
+  const projectedActual = structuredClone(actualContent);
+  for (const [dayIndex, desiredDay] of desiredContent.days.entries()) {
+    const actualDay = projectedActual.days[dayIndex];
+    if (!actualDay || actualDay.date !== desiredDay.date)
+      continue;
+    for (const [itemIndex, desiredItem] of desiredDay.items.entries()) {
+      const actualItem = actualDay.items[itemIndex];
+      if (!actualItem)
+        continue;
+      if (desiredItem.place.coverMediaId === undefined) {
+        delete actualItem.place.coverMediaId;
+      }
+      if (desiredItem.categoryId === undefined) {
+        delete actualItem.categoryId;
+      }
+    }
+  }
+  return canonicalize(projectedActual) === canonicalize(desiredContent);
+}
+
+// src/provider/normalize.ts
+function asRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+function pickString(object2, ...keys) {
+  for (const key of keys) {
+    const value = object2[key];
+    if (typeof value === "string" && value.length > 0)
+      return value;
+    if (typeof value === "number" && Number.isFinite(value))
+      return String(value);
+  }
+  return;
+}
+function pickNumber(object2, ...keys) {
+  for (const key of keys) {
+    const value = object2[key];
+    if (typeof value === "number" && Number.isFinite(value))
+      return value;
+    if (typeof value === "string" && value.trim() !== "") {
+      const number4 = Number(value);
+      if (Number.isFinite(number4))
+        return number4;
+    }
+  }
+  return;
+}
+function normalizeDate(value) {
+  if (typeof value !== "string")
+    return "1970-01-01";
+  const match = value.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : "1970-01-01";
+}
+function providerDate(value) {
+  return value.replaceAll("-", "/");
+}
+function dateAtOffset(startDate, offset) {
+  const date5 = new Date(`${startDate}T00:00:00Z`);
+  date5.setUTCDate(date5.getUTCDate() + offset);
+  return date5.toISOString().slice(0, 10);
+}
+function dayNumber(startDate, date5) {
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  const target = Date.parse(`${date5}T00:00:00Z`);
+  return Math.floor((target - start) / 86400000) + 1;
+}
+function totalDays(startDate, endDate) {
+  return dayNumber(startDate, endDate);
+}
+function extractTripRoot(data, tripId) {
+  if (!Array.isArray(data))
+    return asRecord(data);
+  const records = data.map(asRecord);
+  if (tripId) {
+    const match = records.find((candidate) => {
+      const info = asRecord(candidate.travelScheduleInfo);
+      return pickString(info, "id", "Id") === tripId;
+    });
+    if (match)
+      return match;
+  }
+  return records[0] ?? {};
+}
+function normalizePermission(permission) {
+  if (typeof permission !== "string")
+    return "unknown";
+  const normalized = permission.toLowerCase();
+  return normalized === "owner" || normalized === "editor" || normalized === "viewer" ? normalized : "unknown";
+}
+function normalizeOwnership(permission) {
+  return normalizePermission(permission) === "owner" ? "owned" : "collaborating";
+}
+function normalizeDestinations(value) {
+  return asArray(value).map(asRecord).map((destination) => ({
+    providerLocationKey: pickString(destination, "locationKey", "LocationKey", "id", "Id") ?? "",
+    name: pickString(destination, "locationName", "name", "Name", "title") ?? ""
+  })).filter((destination) => destination.providerLocationKey && destination.name).map((destination) => DestinationSchema.parse(destination));
+}
+function normalizeTripSummary(raw) {
+  const record2 = asRecord(raw);
+  const destinations = normalizeDestinations(record2.destinationList);
+  const startDate = normalizeDate(record2.startDate ?? record2.StartDate);
+  const endDate = normalizeDate(record2.endDate ?? record2.EndDate);
+  return TripSummarySchema.parse({
+    id: pickString(record2, "id", "Id") ?? "",
+    title: pickString(record2, "name", "Name") ?? "Untitled trip",
+    startDate,
+    endDate,
+    ownership: normalizeOwnership(record2.permission),
+    permission: normalizePermission(record2.permission),
+    destinationNames: destinations.map((destination) => destination.name),
+    providerVersion: pickString(record2, "updateTime", "UpdateTime")
+  });
+}
+function normalizeStartsAt(raw, itineraryDate) {
+  const customFlag = raw.isUseCustomArrivalTime === true || raw.IsUseCustomArrivalTime === true || pickNumber(raw, "isUseCustomArrivalTime", "IsUseCustomArrivalTime") === 1;
+  if (!customFlag)
+    return;
+  const candidate = pickString(raw, "customArrivalTime", "CustomArrivalTime");
+  if (!candidate)
+    return;
+  const time3 = candidate.match(/(?:T|\s)(\d{2}:\d{2}(?::\d{2})?)/)?.[1];
+  if (!time3)
+    return;
+  const normalized = `${itineraryDate}T${time3.length === 5 ? `${time3}:00` : time3}`;
+  const withOffset = /(?:Z|[+-]\d{2}:\d{2})$/.test(normalized) ? normalized : `${normalized}+08:00`;
+  const parsed = Date.parse(withOffset);
+  return Number.isFinite(parsed) ? withOffset : undefined;
+}
+function normalizeItem(raw, itineraryDate) {
+  const record2 = asRecord(raw);
+  const nestedPoi = asRecord(record2.poi);
+  const cover = asRecord(record2.cover);
+  const id = pickString(record2, "tsdId", "TsdId", "travelScheduleDetailId", "id", "Id") ?? "";
+  const providerPlaceId = pickString(record2, "poiId", "PoiId", "placeId") ?? pickString(nestedPoi, "id", "Id") ?? `unknown:${id}`;
+  const place = PlaceRefSchema.parse({
+    providerPlaceId,
+    name: pickString(record2, "name", "Name", "tsdName", "TsdName") ?? pickString(nestedPoi, "name", "Name") ?? "Untitled place",
+    latitude: pickNumber(record2, "latitude", "Latitude", "lat") ?? pickNumber(nestedPoi, "latitude", "Latitude", "lat"),
+    longitude: pickNumber(record2, "longitude", "Longitude", "lon", "lng") ?? pickNumber(nestedPoi, "longitude", "Longitude", "lon", "lng"),
+    coverMediaId: pickString(record2, "coverMediaId", "TsdCoverMediaId") ?? pickString(cover, "id", "Id")
+  });
+  const startsAt = normalizeStartsAt(record2, itineraryDate);
+  const durationMinutes = pickNumber(record2, "stayTime", "StayTime");
+  const note = pickString(record2, "note", "Note");
+  const categoryId = pickString(record2, "poiClassificationId", "PoiClassificationId");
+  return {
+    ...id ? { id } : {},
+    place,
+    ...startsAt ? { startsAt } : {},
+    ...durationMinutes !== undefined ? { durationMinutes } : {},
+    ...note ? { note } : {},
+    ...categoryId ? { categoryId } : {}
+  };
+}
+function normalizeTrip(data, tripId) {
+  const root = extractTripRoot(data, tripId);
+  const infoCandidate = asRecord(root.travelScheduleInfo);
+  const info = Object.keys(infoCandidate).length > 0 ? infoCandidate : root;
+  const id = pickString(info, "id", "Id") ?? tripId ?? "";
+  const startDate = normalizeDate(info.startDate ?? info.StartDate);
+  const endDate = normalizeDate(info.endDate ?? info.EndDate);
+  const rawDays = asArray(root.dayList).length > 0 ? asArray(root.dayList) : asArray(root.days).length > 0 ? asArray(root.days) : asArray(root.travelScheduleDayList);
+  const days = rawDays.map((rawDay, index) => {
+    const day = asRecord(rawDay);
+    const dayIndex = (pickNumber(day, "day", "Day") ?? index + 1) - 1;
+    const date5 = normalizeDate(day.date ?? day.Date) !== "1970-01-01" ? normalizeDate(day.date ?? day.Date) : dateAtOffset(startDate, dayIndex);
+    const itemsSource = asArray(day.tsdList).length > 0 ? asArray(day.tsdList) : asArray(day.travelScheduleDetailList).length > 0 ? asArray(day.travelScheduleDetailList) : asArray(day.detailList).length > 0 ? asArray(day.detailList) : asArray(day.items);
+    return {
+      date: date5,
+      items: itemsSource.map((item) => normalizeItem(item, date5))
+    };
+  });
+  const numberOfDays = Math.max(1, totalDays(startDate, endDate));
+  const byDate = new Map(days.map((day) => [day.date, day]));
+  const completeDays = Array.from({ length: numberOfDays }, (_, index) => {
+    const date5 = dateAtOffset(startDate, index);
+    return byDate.get(date5) ?? { date: date5, items: [] };
+  });
+  const base = {
+    id,
+    title: pickString(info, "name", "Name") ?? "Untitled trip",
+    startDate,
+    endDate,
+    timezone: "Asia/Taipei",
+    destinations: normalizeDestinations(info.destinationList),
+    trafficType: TrafficTypeSchema.safeParse(pickString(info, "trafficType", "TrafficType")).data ?? "Custom",
+    days: completeDays,
+    ownership: normalizeOwnership(info.permission),
+    permission: normalizePermission(info.permission)
+  };
+  return TripRecordSchema.parse({
+    ...base,
+    revision: {
+      providerVersion: pickString(info, "updateTime", "UpdateTime"),
+      contentHash: tripContentHash(base),
+      readAt: new Date().toISOString()
+    }
+  });
+}
+function normalizePlaceResults(data, limit) {
+  const root = asRecord(data);
+  const candidates = asArray(root.result).length > 0 ? asArray(root.result) : asArray(root.data).length > 0 ? asArray(root.data) : asArray(data);
+  return candidates.slice(0, limit).map(asRecord).map((place) => {
+    const cover = asRecord(place.cover);
+    return {
+      providerPlaceId: pickString(place, "poiId", "id", "Id") ?? "",
+      name: pickString(place, "name", "Name", "title") ?? "",
+      latitude: pickNumber(place, "latitude", "Latitude", "lat"),
+      longitude: pickNumber(place, "longitude", "Longitude", "lng", "lon"),
+      coverMediaId: pickString(place, "coverMediaId", "CoverMediaId") ?? pickString(cover, "id", "Id")
+    };
+  }).filter((place) => place.providerPlaceId && place.name).map((place) => PlaceRefSchema.parse(place));
+}
+function normalizeDestinationResults(data, limit) {
+  const root = asRecord(data);
+  const candidates = asArray(root.result).length > 0 ? asArray(root.result) : asArray(root.locationList).length > 0 ? asArray(root.locationList) : asArray(data);
+  return normalizeDestinations(candidates).slice(0, limit);
+}
+
+// src/transport/browser.ts
+function versionFrom(value) {
+  if (typeof value === "string" || typeof value === "number")
+    return String(value);
+  const record2 = asRecord(value);
+  return pickString(record2, "travelScheduleUpdateTime", "TravelScheduleUpdateTime", "updateTime", "UpdateTime");
+}
+function requireVersionFrom(value, operation) {
+  const version2 = versionFrom(value);
+  if (!version2) {
+    throw new AppError("PROVIDER_INDETERMINATE", `chicTrip did not return a new itinerary revision after ${operation}.`);
+  }
+  return version2;
+}
+function providerFlag(record2, ...keys) {
+  for (const key of keys) {
+    const value = record2[key];
+    if (value === true || value === 1 || value === "1")
+      return 1;
+    if (value === false || value === 0 || value === "0")
+      return 0;
+  }
+  return 0;
+}
+function providerWallClock(value) {
+  if (!value)
+    return "";
+  const match = value.match(/(?:T|\s|^)(\d{2}:\d{2})(?::(\d{2}))?/);
+  if (!match?.[1])
+    return "";
+  return `0001/01/01 ${match[1]}:${match[2] ?? "00"}`;
+}
+function addItemNeedsFollowUpUpdate(operation) {
+  return operation.item.startsAt !== undefined || operation.item.durationMinutes !== undefined || operation.item.categoryId !== undefined;
+}
+function plannedAddWrites(operation, current) {
+  let requiresSort = operation.afterItemId !== undefined;
+  if (operation.afterItemId && current) {
+    const day = current.days.find((candidate) => candidate.date === operation.date);
+    requiresSort = !day || day.items.at(-1)?.id !== operation.afterItemId;
+  }
+  return 1 + Number(addItemNeedsFollowUpUpdate(operation)) + Number(requiresSort);
+}
+function plannedWritesForOperations(current, operations) {
+  let startDate = current.startDate;
+  let endDate = current.endDate;
+  let layouts = current.days.map((day, dayIndex) => ({
+    date: day.date,
+    itemIds: day.items.map((item, itemIndex) => item.id ?? `missing:${dayIndex}:${itemIndex}`)
+  }));
+  let syntheticId = 0;
+  let writes = 0;
+  for (const operation of operations) {
+    if (operation.op === "add_item") {
+      const layout = layouts.find((day) => day.date === operation.date);
+      const requiresSort = operation.afterItemId !== undefined && layout?.itemIds.at(-1) !== operation.afterItemId;
+      writes += 1 + Number(addItemNeedsFollowUpUpdate(operation)) + Number(requiresSort);
+      if (layout) {
+        const newId = `planned-add:${syntheticId++}`;
+        if (operation.afterItemId) {
+          const anchorIndex = layout.itemIds.indexOf(operation.afterItemId);
+          layout.itemIds.splice(anchorIndex >= 0 ? anchorIndex + 1 : layout.itemIds.length, 0, newId);
+        } else {
+          layout.itemIds.push(newId);
+        }
+      }
+      continue;
+    }
+    writes += 1;
+    if (operation.op === "remove_item") {
+      for (const layout of layouts) {
+        const index = layout.itemIds.indexOf(operation.itemId);
+        if (index >= 0) {
+          layout.itemIds.splice(index, 1);
+          break;
+        }
+      }
+    } else if (operation.op === "move_item") {
+      const source = layouts.find((day) => day.itemIds.includes(operation.itemId));
+      const target = layouts.find((day) => day.date === operation.toDate);
+      if (source && target) {
+        source.itemIds.splice(source.itemIds.indexOf(operation.itemId), 1);
+        const anchorIndex = operation.afterItemId ? target.itemIds.indexOf(operation.afterItemId) : target.itemIds.length - 1;
+        target.itemIds.splice(anchorIndex + 1, 0, operation.itemId);
+      }
+    } else if (operation.op === "set_trip_fields") {
+      const nextStart = operation.fields.startDate ?? startDate;
+      const nextEnd = operation.fields.endDate ?? endDate;
+      if (totalDays(nextStart, nextEnd) === layouts.length) {
+        layouts = layouts.map((layout, index) => ({
+          date: dateAtOffset(nextStart, index),
+          itemIds: layout.itemIds
+        }));
+      }
+      startDate = nextStart;
+      endDate = nextEnd;
+    }
+  }
+  return writes;
+}
+function providerProgressDetails(tripId, completedSteps, totalSteps) {
+  return { tripId, completedSteps, totalSteps };
+}
+function requireAcceptedWriteVersion(value, operation, tripId, completedBefore, totalSteps) {
+  try {
+    return requireVersionFrom(value, operation);
+  } catch (error51) {
+    throw new AppError("PROVIDER_INDETERMINATE", `chicTrip accepted ${operation} but did not return a usable itinerary revision.`, {
+      cause: error51,
+      details: providerProgressDetails(tripId, completedBefore + 1, totalSteps)
+    });
+  }
+}
+function hasIndeterminateProgress(error51) {
+  return error51 instanceof AppError && error51.code === "PROVIDER_INDETERMINATE" && typeof error51.details === "object" && error51.details !== null;
+}
+async function requestMutation(api2, request, operation, tripId, completedBefore, totalSteps) {
+  try {
+    return await api2.request(request);
+  } catch (error51) {
+    if (hasIndeterminateProgress(error51))
+      throw error51;
+    if (error51 instanceof AppError && error51.code !== "PROVIDER_INDETERMINATE") {
+      throw error51;
+    }
+    throw new AppError("PROVIDER_INDETERMINATE", `${operation} may have reached chicTrip, but its outcome could not be determined.`, {
+      cause: error51,
+      details: providerProgressDetails(tripId, completedBefore + 1, totalSteps)
+    });
+  }
+}
+
+class BrowserChicTripTransport {
+  session;
+  config;
+  kind = "browser";
+  api;
+  constructor(session, config2, api2) {
+    this.session = session;
+    this.config = config2;
+    this.api = api2 ?? new BrowserApiClient(session, config2);
+  }
+  async getCapabilities() {
+    const status = await this.session.status();
+    const writes = this.config.enableUndocumentedWrites;
+    const addItems = writes && this.config.enableExperimentalItemAdds;
+    return {
+      transport: this.kind,
+      supportLevel: "experimental-undocumented",
+      authenticated: status.authenticated,
+      ...status.accountRefHash ? { accountRefHash: status.accountRefHash } : {},
+      read: {
+        listTrips: true,
+        getTrip: true,
+        searchPlaces: true,
+        searchDestinations: true
+      },
+      write: {
+        createTrip: writes,
+        updateTripFields: writes,
+        addItem: addItems,
+        updateItem: writes,
+        moveItem: writes,
+        removeItem: writes,
+        deleteTrip: false,
+        requiresApproval: true,
+        idempotency: "local-ledger",
+        atomicity: "multi-step"
+      },
+      caveats: [
+        "This adapter uses undocumented chicTrip web endpoints and may break when the vendor changes them.",
+        "No password, cookie, access token, or refresh token leaves the dedicated local browser profile.",
+        ...writes ? [] : [
+          "Writes are disabled. Set CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=1 only after reviewing the risks."
+        ],
+        ...addItems ? [
+          "Item adds use the currently observed p1 web-client flow and remain experimental."
+        ] : this.config.enableExperimentalItemAdds ? [
+          "Item adds remain disabled until CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=1 is also set."
+        ] : [
+          "Item adds require the separate CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=1 opt-in."
+        ],
+        "Moving itinerary items is limited to reordering within the same day."
+      ]
+    };
+  }
+  async listTrips(input) {
+    const response = await this.api.request({
+      method: "GET",
+      path: "/TravelSchedule/GetMyAndCollaboration",
+      query: { updateTime: 0, orderByColumn: "updatetime", sort: "desc" }
+    });
+    return asArray(response.data).map(normalizeTripSummary).filter((trip) => input.scope === "all" || trip.ownership === input.scope).slice(0, input.limit);
+  }
+  async getTrip(tripId) {
+    const trip = normalizeTrip(await this.rawTrip(tripId), tripId);
+    if (!trip.id)
+      throw new AppError("NOT_FOUND", `Trip not found: ${tripId}`);
+    return trip;
+  }
+  async searchPlaces(input) {
+    const response = await this.api.request({
+      method: "GET",
+      path: "/PoiSearch/SearchByKeyword",
+      query: {
+        keyword: input.query,
+        centerLatitude: input.centerLatitude ?? 25.0478,
+        centerLongitude: input.centerLongitude ?? 121.5319
+      }
+    });
+    return normalizePlaceResults(response.data, input.limit);
+  }
+  async searchDestinations(input) {
+    const response = await this.api.request({
+      method: "GET",
+      path: "/Location/SearchV2",
+      query: { key: input.query }
+    });
+    return normalizeDestinationResults(response.data, input.limit);
+  }
+  async createTrip(input, context) {
+    this.requireWrite("createTrip");
+    const items = input.days.flatMap((day) => day.items.map((item) => ({ date: day.date, item })));
+    if (items.length > 0)
+      this.requireItemAdds();
+    if (items.some(({ item }) => item.note)) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary item notes is not covered by the observed provider contract.");
+    }
+    const itemOperations = items.map(({ date: date5, item }) => ({
+      op: "add_item",
+      date: date5,
+      item
+    }));
+    const totalSteps = 1 + itemOperations.reduce((sum, operation) => sum + plannedAddWrites(operation), 0);
+    const coverResponse = await this.api.request({
+      method: "GET",
+      path: "/TravelSchedule/GetSystemCoverList"
+    });
+    const firstCover = asRecord(asArray(coverResponse.data)[0]);
+    const coverMediaId = pickString(firstCover, "id", "Id");
+    if (!coverMediaId) {
+      throw new AppError("PROVIDER_INDETERMINATE", "Could not resolve the system cover required for trip creation.");
+    }
+    const labelsResponse = await this.api.request({
+      method: "GET",
+      path: "/TravelScheduleUserLabel/Get"
+    });
+    const defaultLabels = asArray(labelsResponse.data).map(asRecord).filter((candidate) => candidate.isSystem === true && pickString(candidate, "name") === "未標籤");
+    const defaultLabelId = defaultLabels.length === 1 ? pickString(defaultLabels[0] ?? {}, "id") : undefined;
+    if (!defaultLabelId) {
+      throw new AppError("PROVIDER_INDETERMINATE", "Could not resolve the unique system 未標籤 label required for trip creation.");
+    }
+    const createResponse = await this.api.request({
+      method: "POST",
+      path: "/TravelSchedule/AddV2",
+      expectedAccountRefHash: context.expectedAccountRefHash,
+      language: "zh-tw",
+      bodyEncoding: "form",
+      body: {
+        CoverMediaId: coverMediaId,
+        Name: input.title,
+        StartDate: providerDate(input.startDate),
+        EndDate: providerDate(input.endDate),
+        TotalDay: totalDays(input.startDate, input.endDate),
+        ViewMode: "DetailMode",
+        TravelScheduleUserLabelId: defaultLabelId,
+        id: "",
+        TrafficType: input.trafficType,
+        IsForceUpdateTsdRoute: 0,
+        updateTime: 0,
+        LocationKey: input.destinations.map((destination) => destination.providerLocationKey)
+      }
+    });
+    const created = asRecord(createResponse.data);
+    const tripId = pickString(created, "id", "Id");
+    if (!tripId) {
+      throw new AppError("PROVIDER_INDETERMINATE", "chicTrip did not return the created trip ID.");
+    }
+    let updateTime;
+    try {
+      updateTime = requireVersionFrom(created, "AddV2");
+    } catch (error51) {
+      throw new AppError("PROVIDER_INDETERMINATE", "chicTrip accepted trip creation but did not return a usable revision.", {
+        cause: error51,
+        details: providerProgressDetails(tripId, 1, totalSteps)
+      });
+    }
+    let completedSteps = 1;
+    if (itemOperations.length > 0) {
+      let current;
+      try {
+        current = await this.readBackAtVersion(tripId, updateTime, completedSteps, totalSteps);
+      } catch (error51) {
+        if (error51 instanceof AppError && error51.code === "PROVIDER_INDETERMINATE") {
+          throw new AppError("PROVIDER_PARTIAL", "The trip shell was created, but its item plan could not be continued safely.", {
+            cause: error51,
+            details: providerProgressDetails(tripId, completedSteps, totalSteps)
+          });
+        }
+        throw error51;
+      }
+      for (const operation of itemOperations) {
+        let outcome;
+        try {
+          outcome = await this.addItem(tripId, operation, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+        } catch (error51) {
+          if (error51 instanceof AppError && (error51.code === "PROVIDER_PARTIAL" || error51.code === "PROVIDER_INDETERMINATE") && typeof error51.details === "object" && error51.details !== null) {
+            throw error51;
+          }
+          throw new AppError("PROVIDER_PARTIAL", "The trip shell was created, but only part of its item plan was applied.", {
+            cause: error51,
+            details: providerProgressDetails(tripId, completedSteps, totalSteps)
+          });
+        }
+        updateTime = outcome.providerVersion;
+        completedSteps = outcome.completedSteps;
+        current = outcome.trip;
+      }
+    }
+    return {
+      tripId,
+      providerVersion: updateTime,
+      completedSteps,
+      totalSteps
+    };
+  }
+  async updateTrip(tripId, operations, context) {
+    this.requireWrite("updateTrip");
+    let current = await this.getTrip(tripId);
+    if (context.expectedRevision && (current.revision.contentHash !== context.expectedRevision.contentHash || context.expectedRevision.providerVersion && current.revision.providerVersion !== context.expectedRevision.providerVersion)) {
+      throw new AppError("CONFLICT", "The itinerary changed before the first provider write.");
+    }
+    if (!current.revision.providerVersion) {
+      throw new AppError("PROVIDER_INDETERMINATE", "The itinerary has no provider revision, so no write can be attempted safely.");
+    }
+    let updateTime = current.revision.providerVersion;
+    let completedSteps = 0;
+    const totalSteps = plannedWritesForOperations(current, operations);
+    try {
+      for (const operation of operations) {
+        let operationReadBackHandled = false;
+        switch (operation.op) {
+          case "set_trip_fields":
+            updateTime = await this.updateTripFields(tripId, operation.fields, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+            break;
+          case "add_item": {
+            this.requireItemAdds();
+            const outcome = await this.addItem(tripId, operation, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+            updateTime = outcome.providerVersion;
+            completedSteps = outcome.completedSteps;
+            current = outcome.trip;
+            operationReadBackHandled = true;
+            break;
+          }
+          case "update_item":
+            updateTime = await this.updateItem(tripId, operation.itemId, operation.fields, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+            break;
+          case "remove_item":
+            updateTime = await this.removeItem(tripId, operation.itemId, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+            break;
+          case "move_item":
+            updateTime = await this.moveItem(tripId, operation.itemId, operation.toDate, operation.afterItemId, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
+            break;
+        }
+        if (!operationReadBackHandled) {
+          completedSteps += 1;
+          current = await this.readBackAtVersion(tripId, updateTime, completedSteps, totalSteps);
+        }
+      }
+    } catch (error51) {
+      if (error51 instanceof AppError && (error51.code === "PROVIDER_PARTIAL" || error51.code === "PROVIDER_INDETERMINATE") && typeof error51.details === "object" && error51.details !== null) {
+        throw error51;
+      }
+      if (completedSteps > 0) {
+        throw new AppError("PROVIDER_PARTIAL", "Only part of the requested itinerary update was applied.", {
+          cause: error51,
+          details: { tripId, completedSteps, totalSteps }
+        });
+      }
+      throw error51;
+    }
+    return { tripId, providerVersion: updateTime, completedSteps, totalSteps };
+  }
+  requireWrite(capability) {
+    if (!this.config.enableUndocumentedWrites) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", `${capability} is disabled for undocumented chicTrip endpoints.`);
+    }
+  }
+  requireItemAdds() {
+    if (!this.config.enableExperimentalItemAdds) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary items requires CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=1.");
+    }
+  }
+  async readBackAtVersion(tripId, expectedVersion, completedSteps, totalSteps) {
+    let trip;
+    try {
+      trip = await this.getTrip(tripId);
+    } catch (error51) {
+      throw new AppError("PROVIDER_INDETERMINATE", "A provider write returned, but the itinerary could not be read back safely.", {
+        cause: error51,
+        details: providerProgressDetails(tripId, completedSteps, totalSteps)
+      });
+    }
+    if (!trip.revision.providerVersion || trip.revision.providerVersion !== expectedVersion) {
+      throw new AppError("PROVIDER_INDETERMINATE", "The provider revision changed or was unavailable during write reconciliation.", {
+        details: providerProgressDetails(tripId, completedSteps, totalSteps)
+      });
+    }
+    return trip;
+  }
+  async addItem(tripId, operation, current, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
+    this.requireItemAdds();
+    if (operation.item.note) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary item notes is not covered by the observed provider contract.");
+    }
+    const dayIndex = current.days.findIndex((day2) => day2.date === operation.date);
+    const day = current.days[dayIndex];
+    if (dayIndex < 0 || !day) {
+      throw new AppError("VALIDATION_ERROR", `Cannot add an item outside the trip: ${operation.date}`);
+    }
+    if (day.items.some((item) => !item.id)) {
+      throw new AppError("PROVIDER_INDETERMINATE", "Cannot safely identify a newly added item because an existing provider item ID is missing.");
+    }
+    const beforeIds = new Set(day.items.map((item) => item.id));
+    let requiresSort = false;
+    if (operation.afterItemId) {
+      const anchorIndex = day.items.findIndex((item) => item.id === operation.afterItemId);
+      if (anchorIndex < 0) {
+        throw new AppError("NOT_FOUND", `The add-item anchor was not found on ${operation.date}: ${operation.afterItemId}`);
+      }
+      requiresSort = anchorIndex !== day.items.length - 1;
+    }
+    const providerDay = dayNumber(current.startDate, operation.date);
+    const placementResponse = await this.api.request({
+      method: "GET",
+      path: "/TravelScheduleDetail/GetAddWhere",
+      query: {
+        poiId: operation.item.place.providerPlaceId,
+        travelScheduleId: tripId,
+        travelScheduleUpdateTime: 0
+      }
+    });
+    const placementDays = asArray(asRecord(placementResponse.data).dayList).map(asRecord);
+    const placementDay = placementDays.find((candidate) => pickNumber(candidate, "day", "Day") === providerDay) ?? placementDays[dayIndex];
+    const candidates = asArray(placementDay?.addWhereList).map(asRecord);
+    const allowedEndTokens = day.items.length === 0 ? new Set(["end", "start", "first"]) : new Set(["end"]);
+    const endCandidate = candidates.find((candidate) => {
+      const token = pickString(candidate, "addWhereId", "AddWhereId");
+      return token ? allowedEndTokens.has(token) : false;
+    });
+    const addWhereId = endCandidate ? pickString(endCandidate, "addWhereId", "AddWhereId") : undefined;
+    if (!addWhereId) {
+      throw new AppError("PROVIDER_INDETERMINATE", "The provider did not return a verified end-of-day insertion choice.");
+    }
+    let completedSteps = completedBefore;
+    const addResponse = await requestMutation(this.api, {
+      method: "POST",
+      path: "/TravelScheduleDetail/Add",
+      expectedAccountRefHash,
+      bodyEncoding: "multipart",
+      body: {
+        TravelScheduleId: tripId,
+        Day: providerDay,
+        PoiId: operation.item.place.providerPlaceId,
+        AddWhereId: addWhereId,
+        TravelScheduleUpdateTime: updateTime,
+        ...operation.item.place.coverMediaId ? { TsdCoverMediaId: operation.item.place.coverMediaId } : {},
+        TsdName: operation.item.place.name
+      }
+    }, "TravelScheduleDetail/Add", tripId, completedSteps, totalSteps);
+    let nextVersion = requireAcceptedWriteVersion(addResponse.data, "TravelScheduleDetail/Add", tripId, completedSteps, totalSteps);
+    completedSteps += 1;
+    let readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
+    const readBackDay = readBack.days.find((candidate) => candidate.date === operation.date);
+    const addedItems = readBackDay?.items.filter((item) => item.id && !beforeIds.has(item.id)) ?? [];
+    if (addedItems.length !== 1 || addedItems[0]?.place.providerPlaceId !== operation.item.place.providerPlaceId) {
+      throw new AppError("PROVIDER_INDETERMINATE", "The item add returned, but a unique new provider item could not be reconciled.", {
+        details: providerProgressDetails(tripId, completedSteps, totalSteps)
+      });
+    }
+    const itemId = addedItems[0].id;
+    if (addItemNeedsFollowUpUpdate(operation)) {
+      try {
+        nextVersion = await this.updateItem(tripId, itemId, {
+          ...operation.item.startsAt ? { startsAt: operation.item.startsAt } : {},
+          ...operation.item.durationMinutes !== undefined ? { durationMinutes: operation.item.durationMinutes } : {},
+          ...operation.item.categoryId !== undefined ? { categoryId: operation.item.categoryId } : {}
+        }, nextVersion, expectedAccountRefHash, completedSteps, totalSteps);
+      } catch (error51) {
+        if (hasIndeterminateProgress(error51))
+          throw error51;
+        throw new AppError("PROVIDER_PARTIAL", "The item was added, but its requested fields were not fully applied.", {
+          cause: error51,
+          details: providerProgressDetails(tripId, completedSteps, totalSteps)
+        });
+      }
+      completedSteps += 1;
+      readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
+    }
+    if (requiresSort && operation.afterItemId) {
+      try {
+        nextVersion = await this.moveItem(tripId, itemId, operation.date, operation.afterItemId, readBack, nextVersion, expectedAccountRefHash, completedSteps, totalSteps);
+      } catch (error51) {
+        if (hasIndeterminateProgress(error51))
+          throw error51;
+        throw new AppError("PROVIDER_PARTIAL", "The item was added, but its requested order was not fully applied.", {
+          cause: error51,
+          details: providerProgressDetails(tripId, completedSteps, totalSteps)
+        });
+      }
+      completedSteps += 1;
+      readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
+    }
+    return {
+      providerVersion: nextVersion,
+      completedSteps,
+      trip: readBack
+    };
+  }
+  async rawTrip(tripId) {
+    const listResponse = await this.api.request({
+      method: "GET",
+      path: "/TravelSchedule/GetMyAndCollaboration",
+      query: { updateTime: 0, orderByColumn: "updatetime", sort: "desc" }
+    });
+    const summary = asArray(listResponse.data).map(normalizeTripSummary).find((candidate) => candidate.id === tripId);
+    if (!summary)
+      throw new AppError("NOT_FOUND", `Trip not found: ${tripId}`);
+    const response = await this.api.request({
+      method: "GET",
+      path: "/TravelScheduleDetail/Get",
+      query: {
+        travelScheduleId: tripId,
+        travelScheduleName: summary.title,
+        TravelScheduleUpdateTime: summary.providerVersion ?? 0,
+        isMyTravelSchedule: summary.permission === "owner" ? 1 : 0
+      }
+    });
+    return extractTripRoot(response.data, tripId);
+  }
+  async updateTripFields(tripId, fields, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
+    const root = await this.rawTrip(tripId);
+    const info = asRecord(root.travelScheduleInfo);
+    const startDate = fields.startDate ?? normalizeTrip(root, tripId).startDate;
+    const endDate = fields.endDate ?? normalizeTrip(root, tripId).endDate;
+    const destinations = fields.destinations ?? normalizeTrip(root, tripId).destinations;
+    const verify = await this.api.request({
+      method: "GET",
+      path: "/TravelScheduleDetail/VerifyUpdateTime",
+      query: {
+        TravelScheduleId: tripId,
+        travelScheduleUpdateTime: updateTime
+      }
+    });
+    const latestVersion = requireVersionFrom(verify.data, "VerifyUpdateTime");
+    const response = await requestMutation(this.api, {
+      method: "PUT",
+      path: "/TravelSchedule/UpdateV3",
+      expectedAccountRefHash,
+      language: "zh-tw",
+      bodyEncoding: "form",
+      body: {
+        CoverMediaId: pickString(info, "coverMediaId", "CoverMediaId") ?? "",
+        Name: fields.title ?? pickString(info, "name", "Name") ?? "Untitled trip",
+        StartDate: providerDate(startDate),
+        EndDate: providerDate(endDate),
+        TotalDay: totalDays(startDate, endDate),
+        ViewMode: pickString(info, "viewMode", "ViewMode") ?? "DetailMode",
+        TravelScheduleUserLabelId: pickString(info, "userLabelId", "TravelScheduleUserLabelId") ?? "",
+        id: tripId,
+        TrafficType: fields.trafficType ?? pickString(info, "trafficType", "TrafficType") ?? "Custom",
+        IsForceUpdateTsdRoute: 0,
+        updateTime: latestVersion,
+        LocationKey: destinations.map((destination) => destination.providerLocationKey)
+      }
+    }, "UpdateV3", tripId, completedBefore, totalSteps);
+    return requireAcceptedWriteVersion(response.data, "UpdateV3", tripId, completedBefore, totalSteps);
+  }
+  async updateItem(tripId, itemId, fields, updateTime, expectedAccountRefHash, completedBefore = 0, totalSteps = 1) {
+    if (fields.note !== undefined) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "Updating itinerary item notes is not yet mapped to a verified provider contract.");
+    }
+    const edit = await this.api.request({
+      method: "GET",
+      path: "/TravelScheduleDetail/GetEditInfo",
+      query: {
+        TsdId: itemId,
+        TravelScheduleId: tripId,
+        TravelScheduleUpdateTime: updateTime
+      }
+    });
+    const current = asRecord(edit.data);
+    const startsAt = fields.startsAt;
+    const timeValue = typeof startsAt === "string" ? providerWallClock(startsAt) : "";
+    const currentArrivalTime = providerWallClock(pickString(current, "customArrivalTime", "CustomArrivalTime"));
+    const currentDepartureTime = providerWallClock(pickString(current, "departureTime", "DepartureTime", "customDepartureTime", "CustomDepartureTime"));
+    const response = await requestMutation(this.api, {
+      method: "PUT",
+      path: "/TravelScheduleDetail/Update",
+      ...expectedAccountRefHash ? { expectedAccountRefHash } : {},
+      bodyEncoding: "multipart",
+      body: {
+        TsdId: itemId,
+        Name: fields.name ?? pickString(current, "name", "Name") ?? "Untitled place",
+        PoiClassificationId: fields.categoryId === null ? "" : fields.categoryId ?? pickString(current, "poiClassificationId", "PoiClassificationId") ?? "",
+        StayTime: fields.durationMinutes ?? pickNumber(current, "stayTime", "StayTime") ?? 0,
+        IsUseCustomArrivalTime: fields.startsAt === undefined ? providerFlag(current, "isUseCustomArrivalTime", "IsUseCustomArrivalTime") : startsAt ? 1 : 0,
+        CustomArrivalTime: fields.startsAt === undefined ? currentArrivalTime : timeValue,
+        IsUseCustomDepartureTime: providerFlag(current, "isUseCustomDepartureTime", "IsUseCustomDepartureTime"),
+        CustomDepartureTime: currentDepartureTime,
+        TravelScheduleId: tripId,
+        travelScheduleUpdateTime: updateTime
+      }
+    }, "TravelScheduleDetail/Update", tripId, completedBefore, totalSteps);
+    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Update", tripId, completedBefore, totalSteps);
+  }
+  async removeItem(tripId, itemId, trip, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
+    const dayIndex = trip.days.findIndex((day) => day.items.some((item) => item.id === itemId));
+    if (dayIndex < 0)
+      throw new AppError("NOT_FOUND", `Trip item not found: ${itemId}`);
+    const response = await requestMutation(this.api, {
+      method: "DELETE",
+      path: "/TravelScheduleDetail/Delete",
+      expectedAccountRefHash,
+      bodyEncoding: "multipart",
+      body: {
+        TravelScheduleId: tripId,
+        Day: dayIndex + 1,
+        TsdId: itemId,
+        TravelScheduleUpdateTime: updateTime
+      }
+    }, "TravelScheduleDetail/Delete", tripId, completedBefore, totalSteps);
+    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Delete", tripId, completedBefore, totalSteps);
+  }
+  async moveItem(tripId, itemId, toDate, afterItemId, trip, updateTime, expectedAccountRefHash, completedBefore = 0, totalSteps = 1) {
+    const sourceIndex = trip.days.findIndex((day) => day.items.some((item) => item.id === itemId));
+    const targetIndex = trip.days.findIndex((day) => day.date === toDate);
+    if (sourceIndex < 0)
+      throw new AppError("NOT_FOUND", `Trip item not found: ${itemId}`);
+    if (targetIndex < 0) {
+      throw new AppError("VALIDATION_ERROR", `Target date is outside the trip: ${toDate}`);
+    }
+    if (sourceIndex !== targetIndex) {
+      throw new AppError("UNSUPPORTED_CAPABILITY", "Moving itinerary items across days is not covered by the verified current provider contract.");
+    }
+    const targetItems = trip.days[targetIndex]?.items ?? [];
+    if (targetItems.some((item) => !item.id)) {
+      throw new AppError("PROVIDER_INDETERMINATE", "Cannot safely sort an itinerary day because at least one provider item ID is missing.");
+    }
+    const targetIds = targetItems.map((item) => item.id).filter((id) => id !== itemId);
+    const insertionIndex = afterItemId ? targetIds.indexOf(afterItemId) + 1 : targetIds.length;
+    if (afterItemId && insertionIndex === 0) {
+      throw new AppError("NOT_FOUND", `Target item not found: ${afterItemId}`);
+    }
+    targetIds.splice(insertionIndex, 0, itemId);
+    const response = await requestMutation(this.api, {
+      method: "PUT",
+      path: "/TravelScheduleDetail/Sort",
+      ...expectedAccountRefHash ? { expectedAccountRefHash } : {},
+      bodyEncoding: "multipart",
+      body: {
+        TravelScheduleId: tripId,
+        MoveOutDay: sourceIndex + 1,
+        MoveInDay: targetIndex + 1,
+        MoveTsdId: itemId,
+        TsdIdList: targetIds,
+        travelScheduleUpdateTime: updateTime
+      }
+    }, "TravelScheduleDetail/Sort", tripId, completedBefore, totalSteps);
+    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Sort", tripId, completedBefore, totalSteps);
+  }
+}
+
+// src/state/store.ts
+import { randomUUID } from "node:crypto";
+import {
+  chmod as chmod2,
+  mkdir as mkdir2,
+  open,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile
+} from "node:fs/promises";
+import { join as join2 } from "node:path";
+var EMPTY_STATE = {
+  schemaVersion: 1,
+  previews: {},
+  usedApprovalNonces: {},
+  ledger: {}
+};
+function delay(milliseconds) {
+  return new Promise((resolve2) => setTimeout(resolve2, milliseconds));
+}
+
+class JsonStateStore {
+  stateDir;
+  statePath;
+  lockPath;
+  constructor(stateDir) {
+    this.stateDir = stateDir;
+    this.statePath = join2(stateDir, "state.json");
+    this.lockPath = join2(stateDir, "state.lock");
+  }
+  async ensure() {
+    await mkdir2(this.stateDir, { recursive: true, mode: 448 });
+    await chmod2(this.stateDir, 448);
+  }
+  async read() {
+    await this.ensure();
+    try {
+      const raw = await readFile(this.statePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed.schemaVersion !== 1)
+        throw new Error("Unsupported state schema.");
+      return parsed;
+    } catch (error51) {
+      const code = error51.code;
+      if (code === "ENOENT")
+        return structuredClone(EMPTY_STATE);
+      throw error51;
+    }
+  }
+  async update(mutate) {
+    await this.ensure();
+    const release = await this.acquireLock();
+    try {
+      const state = await this.read();
+      const result = await mutate(state);
+      await this.write(state);
+      return result;
+    } finally {
+      await release();
+    }
+  }
+  async write(state) {
+    const temporaryPath = `${this.statePath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}
+`, {
+      mode: 384
+    });
+    await chmod2(temporaryPath, 384);
+    await rename(temporaryPath, this.statePath);
+  }
+  async acquireLock() {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try {
+        const handle = await open(this.lockPath, "wx", 384);
+        await handle.writeFile(`${process.pid}
+`);
+        return async () => {
+          await handle.close();
+          await unlink(this.lockPath).catch(() => {
+            return;
+          });
+        };
+      } catch (error51) {
+        if (error51.code !== "EEXIST")
+          throw error51;
+        try {
+          const lockStat = await stat(this.lockPath);
+          if (Date.now() - lockStat.mtimeMs > 30000) {
+            await unlink(this.lockPath);
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        await delay(25);
+      }
+    }
+    throw new Error("Timed out waiting for the local state lock.");
+  }
+}
+
+// src/state/approval.ts
+import {
+  createHmac,
+  randomBytes,
+  randomUUID as randomUUID2,
+  timingSafeEqual
+} from "node:crypto";
+import { chmod as chmod3, readFile as readFile2, writeFile as writeFile2 } from "node:fs/promises";
+import { join as join3 } from "node:path";
+var ApprovalClaimsSchema = exports_external.object({
+  type: exports_external.literal("chictrip-change-approval"),
+  previewId: exports_external.uuid(),
+  intentHash: exports_external.string(),
+  executionPlanDigest: exports_external.string(),
+  accountRefHash: exports_external.string(),
+  transport: exports_external.enum(["browser", "official-api"]),
+  audience: exports_external.literal("chictrip-apply"),
+  issuedAt: exports_external.number().int(),
+  expiresAt: exports_external.number().int(),
+  nonce: exports_external.uuid()
+});
+function encode3(value) {
+  return Buffer.from(value).toString("base64url");
+}
+function decode3(value) {
+  return Buffer.from(value, "base64url");
+}
+
+class ApprovalService {
+  store;
+  approvalTtlMs;
+  secretPath;
+  constructor(store, approvalTtlMs) {
+    this.store = store;
+    this.approvalTtlMs = approvalTtlMs;
+    this.secretPath = join3(store.stateDir, "approval-secret");
+  }
+  async issue(preview, executionPlanDigest, typedConfirmation) {
+    if (Date.parse(preview.expiresAt) <= Date.now()) {
+      throw new AppError("PREVIEW_EXPIRED", "The preview has expired. Create a new preview.");
+    }
+    if (preview.blockers.length > 0) {
+      throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", {
+        details: preview.blockers
+      });
+    }
+    const expected = `APPLY ${preview.approval.reviewCode}`;
+    if (typedConfirmation.trim() !== expected) {
+      throw new AppError("APPROVAL_INVALID", `Confirmation did not match. Type exactly: ${expected}`);
+    }
+    const now = Date.now();
+    const claims = {
+      type: "chictrip-change-approval",
+      previewId: preview.previewId,
+      intentHash: preview.intentHash,
+      executionPlanDigest,
+      accountRefHash: preview.accountRefHash,
+      transport: preview.transport,
+      audience: "chictrip-apply",
+      issuedAt: now,
+      expiresAt: now + this.approvalTtlMs,
+      nonce: randomUUID2()
+    };
+    const payload = encode3(JSON.stringify(claims));
+    const signature = encode3(createHmac("sha256", await this.secret()).update(payload).digest());
+    return { token: `${payload}.${signature}`, claims };
+  }
+  async verify(token, expected) {
+    const [payload, suppliedSignature, extra] = token.split(".");
+    if (!payload || !suppliedSignature || extra) {
+      throw new AppError("APPROVAL_INVALID", "Malformed confirmation token.");
+    }
+    const expectedSignature = createHmac("sha256", await this.secret()).update(payload).digest();
+    const supplied = decode3(suppliedSignature);
+    if (supplied.length !== expectedSignature.length || !timingSafeEqual(supplied, expectedSignature)) {
+      throw new AppError("APPROVAL_INVALID", "Invalid confirmation token signature.");
+    }
+    let claims;
+    try {
+      claims = ApprovalClaimsSchema.parse(JSON.parse(decode3(payload).toString("utf8")));
+    } catch (error51) {
+      throw new AppError("APPROVAL_INVALID", "Invalid confirmation token claims.", {
+        cause: error51
+      });
+    }
+    if (claims.expiresAt <= Date.now()) {
+      throw new AppError("APPROVAL_EXPIRED", "The confirmation token has expired.");
+    }
+    if (claims.previewId !== expected.previewId || claims.intentHash !== expected.intentHash || claims.executionPlanDigest !== expected.executionPlanDigest || claims.accountRefHash !== expected.accountRefHash || claims.transport !== expected.transport) {
+      throw new AppError("APPROVAL_INVALID", "The confirmation token does not match this preview, account, or transport.");
+    }
+    return claims;
+  }
+  async secret() {
+    await this.store.ensure();
+    try {
+      return await readFile2(this.secretPath);
+    } catch (error51) {
+      if (error51.code !== "ENOENT")
+        throw error51;
+      const secret = randomBytes(32);
+      try {
+        await writeFile2(this.secretPath, secret, { flag: "wx", mode: 384 });
+        await chmod3(this.secretPath, 384);
+        return secret;
+      } catch (writeError) {
+        if (writeError.code !== "EEXIST")
+          throw writeError;
+        return readFile2(this.secretPath);
+      }
+    }
+  }
+}
+
+// src/service/trip-service.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+function findItem(trip, itemId) {
+  for (const [dayIndex, day] of trip.days.entries()) {
+    const itemIndex = day.items.findIndex((item) => item.id === itemId);
+    if (itemIndex >= 0)
+      return { dayIndex, itemIndex };
+  }
+  return;
+}
+function rebuildDateRange(trip) {
+  const count = totalDays(trip.startDate, trip.endDate);
+  const old = new Map(trip.days.map((day) => [day.date, day]));
+  trip.days = Array.from({ length: count }, (_, index) => {
+    const date5 = dateAtOffset(trip.startDate, index);
+    return old.get(date5) ?? { date: date5, items: [] };
+  });
+}
+function explicitClearsMatch(actual, intent) {
+  if (intent.kind !== "update")
+    return true;
+  const finalCategoryChanges = new Map;
+  for (const operation of intent.operations) {
+    if (operation.op === "update_item" && operation.fields.categoryId !== undefined) {
+      finalCategoryChanges.set(operation.itemId, operation.fields.categoryId);
+    }
+  }
+  for (const [itemId, categoryId] of finalCategoryChanges) {
+    if (categoryId !== null)
+      continue;
+    const found = findItem(actual, itemId);
+    if (!found)
+      return false;
+    const item = actual.days[found.dayIndex]?.items[found.itemIndex];
+    if (!item || item.categoryId !== undefined)
+      return false;
+  }
+  return true;
+}
+function applyOperation(desired, operation, diff, blockers) {
+  switch (operation.op) {
+    case "set_trip_fields": {
+      const originalStartDate = desired.startDate;
+      const originalEndDate = desired.endDate;
+      const originalDays = structuredClone(desired.days);
+      for (const [field, after] of Object.entries(operation.fields)) {
+        const key = field;
+        const before = desired[key];
+        if (after !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
+          diff.push({
+            path: `/trip/${field}`,
+            action: "update",
+            before,
+            after
+          });
+          Object.assign(desired, { [field]: after });
+        }
+      }
+      const dateChangeRequested = operation.fields.startDate !== undefined || operation.fields.endDate !== undefined;
+      if (dateChangeRequested) {
+        const originalCount = totalDays(originalStartDate, originalEndDate);
+        const nextCount = totalDays(desired.startDate, desired.endDate);
+        if (nextCount < 1 || nextCount > 60) {
+          blockers.push({
+            code: "INVALID_DATE_RANGE",
+            message: "The requested date range must contain between 1 and 60 days."
+          });
+          desired.startDate = originalStartDate;
+          desired.endDate = originalEndDate;
+          desired.days = originalDays;
+        } else if (nextCount !== originalCount) {
+          blockers.push({
+            code: "DATE_RANGE_RESIZE_UNVERIFIED",
+            message: "Changing the number of itinerary days is not covered by a verified provider workflow."
+          });
+          rebuildDateRange(desired);
+        } else {
+          desired.days = originalDays.map((day, index) => ({
+            date: dateAtOffset(desired.startDate, index),
+            items: day.items
+          }));
+        }
+      } else {
+        rebuildDateRange(desired);
+      }
+      break;
+    }
+    case "add_item": {
+      const day = desired.days.find((candidate) => candidate.date === operation.date);
+      if (!day) {
+        blockers.push({
+          code: "DATE_OUTSIDE_TRIP",
+          message: `Cannot add an item outside the trip: ${operation.date}`
+        });
+        return;
+      }
+      let index = day.items.length;
+      if (operation.afterItemId) {
+        const afterIndex = day.items.findIndex((item2) => item2.id === operation.afterItemId);
+        if (afterIndex < 0) {
+          blockers.push({
+            code: "ITEM_NOT_FOUND",
+            message: `afterItemId was not found on ${operation.date}.`
+          });
+          return;
+        }
+        index = afterIndex + 1;
+      }
+      const item = structuredClone(operation.item);
+      day.items.splice(index, 0, item);
+      diff.push({
+        path: `/days/${operation.date}/items/${index}`,
+        action: "add",
+        after: operation.item
+      });
+      break;
+    }
+    case "update_item": {
+      const found = findItem(desired, operation.itemId);
+      if (!found) {
+        blockers.push({
+          code: "ITEM_NOT_FOUND",
+          message: `Trip item was not found: ${operation.itemId}`
+        });
+        return;
+      }
+      const item = desired.days[found.dayIndex]?.items[found.itemIndex];
+      if (!item)
+        return;
+      for (const [field, after] of Object.entries(operation.fields)) {
+        let before;
+        if (field === "name") {
+          before = item.place.name;
+          if (after !== undefined)
+            item.place.name = String(after);
+        } else {
+          const key = field;
+          before = item[key];
+          if (after === null) {
+            delete item[key];
+          } else if (after !== undefined) {
+            Object.assign(item, { [key]: after });
+          }
+        }
+        if (after !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
+          diff.push({
+            path: `/items/${operation.itemId}/${field}`,
+            action: "update",
+            before,
+            after
+          });
+        }
+      }
+      break;
+    }
+    case "remove_item": {
+      const found = findItem(desired, operation.itemId);
+      if (!found) {
+        blockers.push({
+          code: "ITEM_NOT_FOUND",
+          message: `Trip item was not found: ${operation.itemId}`
+        });
+        return;
+      }
+      const day = desired.days[found.dayIndex];
+      const [removed] = day?.items.splice(found.itemIndex, 1) ?? [];
+      diff.push({
+        path: `/items/${operation.itemId}`,
+        action: "remove",
+        before: removed
+      });
+      break;
+    }
+    case "move_item": {
+      const found = findItem(desired, operation.itemId);
+      const targetDay = desired.days.find((day) => day.date === operation.toDate);
+      if (!found || !targetDay) {
+        blockers.push({
+          code: "ITEM_NOT_FOUND",
+          message: `Could not resolve the move target for item ${operation.itemId}.`
+        });
+        return;
+      }
+      const sourceDay = desired.days[found.dayIndex];
+      if (sourceDay?.date !== targetDay.date) {
+        blockers.push({
+          code: "MOVE_ACROSS_DAYS_UNVERIFIED",
+          message: "Moving itinerary items across days is not covered by the verified current provider workflow."
+        });
+        return;
+      }
+      const [item] = sourceDay?.items.splice(found.itemIndex, 1) ?? [];
+      if (!item)
+        return;
+      let targetIndex = targetDay.items.length;
+      if (operation.afterItemId) {
+        const afterIndex = targetDay.items.findIndex((candidate) => candidate.id === operation.afterItemId);
+        if (afterIndex < 0) {
+          blockers.push({
+            code: "ITEM_NOT_FOUND",
+            message: `Move anchor was not found: ${operation.afterItemId}`
+          });
+          sourceDay?.items.splice(found.itemIndex, 0, item);
+          return;
+        }
+        targetIndex = afterIndex + 1;
+      }
+      targetDay.items.splice(targetIndex, 0, item);
+      diff.push({
+        path: `/items/${operation.itemId}`,
+        action: "move",
+        before: {
+          date: sourceDay?.date,
+          index: found.itemIndex
+        },
+        after: {
+          date: targetDay.date,
+          index: targetIndex
+        }
+      });
+      break;
+    }
+  }
+}
+function reviewCode(previewId) {
+  return sha256(previewId).slice(0, 8).toUpperCase();
+}
+function executionPlanDigest(stored) {
+  return sha256(stored);
+}
+function assertStoredPreviewIntegrity(stored, expectedPreviewId) {
+  if (stored.preview.previewId !== expectedPreviewId || sha256(stored.intent) !== stored.preview.intentHash) {
+    throw new AppError("APPROVAL_INVALID", "The stored preview no longer matches its approved intent. Create a new preview.");
+  }
+  const expectedBaseRevision = stored.intent.kind === "update" ? stored.intent.baseRevision : undefined;
+  if (sha256(expectedBaseRevision ?? null) !== sha256(stored.preview.baseRevision ?? null)) {
+    throw new AppError("APPROVAL_INVALID", "The stored preview revision binding is invalid. Create a new preview.");
+  }
+  if (!stored.desired || tripContentHash(stored.desired) !== stored.desiredContentHash) {
+    throw new AppError("APPROVAL_INVALID", "The stored desired itinerary failed its integrity check. Create a new preview.");
+  }
+  const computedDigest = executionPlanDigest({
+    preview: stored.preview,
+    intent: stored.intent,
+    desired: stored.desired,
+    desiredContentHash: stored.desiredContentHash
+  });
+  if (!stored.executionPlanDigest || computedDigest !== stored.executionPlanDigest) {
+    throw new AppError("APPROVAL_INVALID", "The stored execution plan failed its integrity check. Create a new preview.");
+  }
+}
+function assertLedgerBinding(entry, expected) {
+  if (entry.previewId !== expected.previewId || entry.intentHash !== expected.intentHash || entry.executionPlanDigest !== expected.executionPlanDigest || entry.accountRefHash !== expected.accountRefHash || entry.transport !== expected.transport) {
+    throw new AppError("IDEMPOTENCY_KEY_REUSED", "The idempotency key is bound to a different preview, account, transport, or execution plan.");
+  }
+}
+function ledgerResult(entry) {
+  if (entry.result) {
+    return {
+      ...entry.result,
+      status: entry.result.status === "applied" ? "already_applied" : entry.result.status
+    };
+  }
+  return {
+    operationId: entry.operationId,
+    status: "indeterminate",
+    reconciliation: {
+      state: "ambiguous",
+      message: "An earlier apply attempt is still in flight or ended before its result was recorded."
+    }
+  };
+}
+function safeReconciliationMessage(code) {
+  switch (code) {
+    case "CONFLICT":
+      return "The provider itinerary revision changed before the approved operation completed.";
+    case "PROVIDER_PARTIAL":
+      return "The provider may have applied only part of the approved operation. Reconcile by reading the itinerary.";
+    case "PROVIDER_ERROR":
+    case "PROVIDER_INDETERMINATE":
+      return "The provider write outcome could not be determined safely. Reconcile by reading the itinerary.";
+    default:
+      return "The approved operation failed without exposing provider diagnostics.";
+  }
+}
+
+class TripService {
+  transport;
+  store;
+  approval;
+  config;
+  constructor(transport, store, approval, config2) {
+    this.transport = transport;
+    this.store = store;
+    this.approval = approval;
+    this.config = config2;
+  }
+  capabilities() {
+    return this.transport.getCapabilities();
+  }
+  async listTrips(input) {
+    return this.transport.listTrips(ListTripsInputSchema.parse(input));
+  }
+  async getTrip(tripId) {
+    if (!tripId)
+      throw new AppError("VALIDATION_ERROR", "tripId is required.");
+    return this.transport.getTrip(tripId);
+  }
+  async searchPlaces(input) {
+    return this.transport.searchPlaces(SearchPlacesInputSchema.parse(input));
+  }
+  async searchDestinations(input) {
+    return this.transport.searchDestinations(SearchDestinationsInputSchema.parse(input));
+  }
+  async preview(input) {
+    const intent = TripChangeIntentSchema.parse(input);
+    const capabilities = await this.transport.getCapabilities();
+    if (!capabilities.authenticated || !capabilities.accountRefHash) {
+      throw new AppError("AUTH_REQUIRED", "Complete local chicTrip login before previewing account changes.");
+    }
+    const diff = [];
+    const blockers = [];
+    const warnings = [
+      {
+        code: "UNDOCUMENTED_PROVIDER_API",
+        message: "This preview targets undocumented chicTrip web endpoints. Review it carefully."
+      }
+    ];
+    let desired;
+    let baseRevision;
+    if (intent.kind === "create") {
+      desired = structuredClone(intent.desired);
+      diff.push({ path: "/trip", action: "add", after: desired });
+      if (!capabilities.write.createTrip) {
+        blockers.push({
+          code: "CREATE_DISABLED",
+          message: "Creating trips is disabled for the current transport configuration."
+        });
+      }
+      const items = desired.days.flatMap((day) => day.items);
+      if (items.length > 0 && !capabilities.write.addItem) {
+        blockers.push({
+          code: "ADD_ITEM_DISABLED",
+          message: "The plan contains itinerary items, but experimental item adds are not enabled."
+        });
+      }
+      if (items.some((item) => item.note)) {
+        blockers.push({
+          code: "ITEM_NOTE_UNSUPPORTED",
+          message: "Item notes are not covered by a verified write contract."
+        });
+      }
+    } else {
+      const current = await this.transport.getTrip(intent.tripId);
+      baseRevision = current.revision;
+      if (current.revision.contentHash !== intent.baseRevision.contentHash || intent.baseRevision.providerVersion && current.revision.providerVersion !== intent.baseRevision.providerVersion) {
+        throw new AppError("CONFLICT", "The itinerary changed since it was read. Fetch it again and create a new preview.", {
+          details: {
+            expectedRevision: intent.baseRevision,
+            currentRevision: current.revision
+          }
+        });
+      }
+      desired = {
+        title: current.title,
+        startDate: current.startDate,
+        endDate: current.endDate,
+        timezone: current.timezone,
+        destinations: structuredClone(current.destinations),
+        trafficType: current.trafficType,
+        days: structuredClone(current.days)
+      };
+      if (current.permission === "viewer" || current.permission === "unknown") {
+        blockers.push({
+          code: "TRIP_NOT_EDITABLE",
+          message: "The current chicTrip permission does not allow this itinerary to be edited."
+        });
+      }
+      for (const operation of intent.operations) {
+        applyOperation(desired, operation, diff, blockers);
+        if (operation.op === "set_trip_fields" && !capabilities.write.updateTripFields) {
+          blockers.push({
+            code: "UPDATE_FIELDS_DISABLED",
+            message: "Trip field updates are disabled."
+          });
+        }
+        if (operation.op === "add_item" && !capabilities.write.addItem) {
+          blockers.push({
+            code: "ADD_ITEM_DISABLED",
+            message: "Adding itinerary items is disabled."
+          });
+        }
+        if (operation.op === "update_item" && !capabilities.write.updateItem) {
+          blockers.push({
+            code: "UPDATE_ITEM_DISABLED",
+            message: "Updating itinerary items is disabled."
+          });
+        }
+        if (operation.op === "update_item" && operation.fields.note !== undefined) {
+          blockers.push({
+            code: "ITEM_NOTE_UNSUPPORTED",
+            message: "Updating item notes is not covered by a verified contract."
+          });
+        }
+        if (operation.op === "move_item" && !capabilities.write.moveItem) {
+          blockers.push({
+            code: "MOVE_ITEM_DISABLED",
+            message: "Moving itinerary items is disabled."
+          });
+        }
+        if (operation.op === "remove_item" && !capabilities.write.removeItem) {
+          blockers.push({
+            code: "REMOVE_ITEM_DISABLED",
+            message: "Removing itinerary items is disabled."
+          });
+        }
+      }
+      if (current.ownership === "collaborating") {
+        warnings.push({
+          code: "COLLABORATIVE_TRIP",
+          message: "This is a collaborative trip. Apply will re-check its revision immediately before writing."
+        });
+      }
+    }
+    desired = TripDraftSchema.parse(desired);
+    const now = Date.now();
+    const previewId = randomUUID3();
+    const intentHash = sha256(intent);
+    const estimatedProviderWrites = intent.kind === "create" ? 1 + intent.desired.days.reduce((sum, day) => sum + day.items.reduce((itemSum, item) => itemSum + 1 + Number(item.durationMinutes !== undefined || item.startsAt !== undefined || item.categoryId !== undefined), 0), 0) : intent.operations.reduce((sum, operation) => {
+      if (operation.op !== "add_item")
+        return sum + 1;
+      return sum + 1 + Number(operation.item.durationMinutes !== undefined || operation.item.startsAt !== undefined || operation.item.categoryId !== undefined) + Number(operation.afterItemId !== undefined);
+    }, 0);
+    const preview = {
+      schemaVersion: "1",
+      previewId,
+      intentHash,
+      transport: this.transport.kind,
+      accountRefHash: capabilities.accountRefHash,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + this.config.previewTtlMs).toISOString(),
+      ...baseRevision ? { baseRevision } : {},
+      diff,
+      blockers,
+      warnings,
+      estimatedProviderWrites,
+      approval: {
+        required: true,
+        reviewCode: reviewCode(previewId),
+        cliCommand: `chictrip changes approve ${previewId}`
+      }
+    };
+    const storedPlan = {
+      preview,
+      intent,
+      desired,
+      desiredContentHash: tripContentHash(desired)
+    };
+    const stored = {
+      ...storedPlan,
+      executionPlanDigest: executionPlanDigest(storedPlan)
+    };
+    await this.store.update((state) => {
+      state.previews[previewId] = stored;
+      for (const [id, candidate] of Object.entries(state.previews)) {
+        if (Date.parse(candidate.preview.expiresAt) < Date.now() - 86400000) {
+          delete state.previews[id];
+        }
+      }
+    });
+    return preview;
+  }
+  async approve(previewId, typedConfirmation) {
+    const state = await this.store.read();
+    const stored = state.previews[previewId];
+    if (!stored)
+      throw new AppError("NOT_FOUND", `Preview not found: ${previewId}`);
+    assertStoredPreviewIntegrity(stored, previewId);
+    if (stored.applyClaim) {
+      throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt and cannot be approved again.");
+    }
+    const issued = await this.approval.issue(stored.preview, stored.executionPlanDigest, typedConfirmation);
+    const approvedAt = new Date(issued.claims.issuedAt).toISOString();
+    const expiresAt = new Date(issued.claims.expiresAt).toISOString();
+    await this.store.update((currentState) => {
+      const currentStored = currentState.previews[previewId];
+      if (!currentStored) {
+        throw new AppError("NOT_FOUND", `Preview not found: ${previewId}`);
+      }
+      assertStoredPreviewIntegrity(currentStored, previewId);
+      if (currentStored.executionPlanDigest !== stored.executionPlanDigest || currentStored.applyClaim) {
+        throw new AppError("APPROVAL_INVALID", "The preview changed or was claimed while approval was being recorded.");
+      }
+      currentStored.approvalGrant = {
+        token: issued.token,
+        issuedAt: approvedAt,
+        expiresAt
+      };
+    });
+    return {
+      previewId,
+      intentHash: stored.preview.intentHash,
+      approvedAt,
+      expiresAt
+    };
+  }
+  async apply(input) {
+    const request = ApplyTripChangeInputSchema.parse(input);
+    const state = await this.store.read();
+    const stored = state.previews[request.previewId];
+    if (!stored) {
+      throw new AppError("NOT_FOUND", `Preview not found: ${request.previewId}`);
+    }
+    assertStoredPreviewIntegrity(stored, request.previewId);
+    if (stored.preview.intentHash !== request.intentHash) {
+      throw new AppError("APPROVAL_INVALID", "intentHash does not match the preview.");
+    }
+    const capabilities = await this.transport.getCapabilities();
+    if (!capabilities.authenticated || !capabilities.accountRefHash) {
+      throw new AppError("AUTH_REQUIRED", "The chicTrip session is not authenticated.");
+    }
+    if (stored.preview.accountRefHash !== capabilities.accountRefHash || stored.preview.transport !== this.transport.kind) {
+      throw new AppError("APPROVAL_INVALID", "The preview is bound to a different chicTrip account or transport.");
+    }
+    const ledgerBinding = {
+      previewId: request.previewId,
+      intentHash: request.intentHash,
+      executionPlanDigest: stored.executionPlanDigest,
+      accountRefHash: capabilities.accountRefHash,
+      transport: this.transport.kind
+    };
+    const existing = state.ledger[request.idempotencyKey];
+    if (existing) {
+      assertLedgerBinding(existing, ledgerBinding);
+      return ledgerResult(existing);
+    }
+    if (stored.applyClaim) {
+      if (stored.applyClaim.idempotencyKey === request.idempotencyKey) {
+        return {
+          operationId: stored.applyClaim.operationId,
+          status: "indeterminate",
+          reconciliation: {
+            state: "ambiguous",
+            message: "This preview was already claimed, but its local ledger entry is unavailable. Do not retry it."
+          }
+        };
+      }
+      throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt. Reconcile that attempt instead of retrying with a new key.");
+    }
+    if (Date.parse(stored.preview.expiresAt) <= Date.now()) {
+      throw new AppError("PREVIEW_EXPIRED", "The preview expired. Create a new one.");
+    }
+    if (stored.preview.blockers.length > 0) {
+      throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", {
+        details: stored.preview.blockers
+      });
+    }
+    if (!stored.approvalGrant) {
+      throw new AppError("APPROVAL_REQUIRED", `Run the interactive local approval command first: chictrip changes approve ${request.previewId}`);
+    }
+    const approvalToken = stored.approvalGrant.token;
+    const claims = await this.approval.verify(approvalToken, {
+      ...ledgerBinding
+    });
+    if (stored.intent.kind === "update") {
+      const current = await this.transport.getTrip(stored.intent.tripId);
+      const base = stored.intent.baseRevision;
+      if (current.revision.contentHash !== base.contentHash || base.providerVersion && current.revision.providerVersion !== base.providerVersion) {
+        throw new AppError("CONFLICT", "The itinerary changed after preview. No write was attempted.");
+      }
+    }
+    const operationId = randomUUID3();
+    const timestamp = new Date().toISOString();
+    const claim = await this.store.update((currentState) => {
+      const currentStored = currentState.previews[request.previewId];
+      if (!currentStored) {
+        throw new AppError("NOT_FOUND", `Preview not found: ${request.previewId}`);
+      }
+      assertStoredPreviewIntegrity(currentStored, request.previewId);
+      if (currentStored.preview.intentHash !== request.intentHash || currentStored.executionPlanDigest !== stored.executionPlanDigest || currentStored.preview.accountRefHash !== capabilities.accountRefHash || currentStored.preview.transport !== this.transport.kind) {
+        throw new AppError("APPROVAL_INVALID", "The preview changed before the write attempt could be claimed.");
+      }
+      if (Date.parse(currentStored.preview.expiresAt) <= Date.now()) {
+        throw new AppError("PREVIEW_EXPIRED", "The preview expired. Create a new one.");
+      }
+      if (currentStored.preview.blockers.length > 0) {
+        throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", { details: currentStored.preview.blockers });
+      }
+      const collision = currentState.ledger[request.idempotencyKey];
+      if (collision) {
+        assertLedgerBinding(collision, ledgerBinding);
+        return { kind: "existing", entry: structuredClone(collision) };
+      }
+      if (currentStored.applyClaim) {
+        if (currentStored.applyClaim.idempotencyKey === request.idempotencyKey) {
+          return {
+            kind: "claimed-without-ledger",
+            operationId: currentStored.applyClaim.operationId
+          };
+        }
+        throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt. Reconcile that attempt instead of retrying with a new key.");
+      }
+      if (currentState.usedApprovalNonces[claims.nonce]) {
+        throw new AppError("APPROVAL_INVALID", "The confirmation token was already used.");
+      }
+      if (currentStored.approvalGrant?.token !== approvalToken) {
+        throw new AppError("APPROVAL_INVALID", "The local approval grant changed before the write attempt was claimed.");
+      }
+      currentState.usedApprovalNonces[claims.nonce] = timestamp;
+      delete currentStored.approvalGrant;
+      currentStored.applyClaim = {
+        idempotencyKey: request.idempotencyKey,
+        operationId,
+        approvalNonce: claims.nonce,
+        claimedAt: timestamp
+      };
+      currentState.ledger[request.idempotencyKey] = {
+        idempotencyKey: request.idempotencyKey,
+        previewId: request.previewId,
+        intentHash: request.intentHash,
+        executionPlanDigest: currentStored.executionPlanDigest,
+        accountRefHash: capabilities.accountRefHash,
+        transport: this.transport.kind,
+        operationId,
+        status: "in_flight",
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      return { kind: "claimed", stored: structuredClone(currentStored) };
+    });
+    if (claim.kind === "existing")
+      return ledgerResult(claim.entry);
+    if (claim.kind === "claimed-without-ledger") {
+      return {
+        operationId: claim.operationId,
+        status: "indeterminate",
+        reconciliation: {
+          state: "ambiguous",
+          message: "This preview was already claimed, but its local ledger entry is unavailable. Do not retry it."
+        }
+      };
+    }
+    const claimedStored = claim.stored;
+    let result;
+    let providerMutationReturned = false;
+    try {
+      const mutation = claimedStored.intent.kind === "create" ? await this.transport.createTrip(claimedStored.intent.desired, {
+        requestId: operationId,
+        idempotencyKey: request.idempotencyKey,
+        expectedAccountRefHash: capabilities.accountRefHash
+      }) : await this.transport.updateTrip(claimedStored.intent.tripId, claimedStored.intent.operations, {
+        requestId: operationId,
+        idempotencyKey: request.idempotencyKey,
+        expectedAccountRefHash: capabilities.accountRefHash,
+        expectedRevision: claimedStored.intent.baseRevision
+      });
+      providerMutationReturned = true;
+      const actual = await this.transport.getTrip(mutation.tripId);
+      const verified = actual.revision.contentHash === claimedStored.desiredContentHash || tripMatchesDesired(actual, claimedStored.desired) && explicitClearsMatch(actual, claimedStored.intent);
+      result = {
+        operationId,
+        status: verified ? "applied" : "indeterminate",
+        tripId: mutation.tripId,
+        revision: actual.revision,
+        completedSteps: mutation.completedSteps,
+        totalSteps: mutation.totalSteps,
+        reconciliation: verified ? {
+          state: "verified",
+          message: "The itinerary was read back and matches the approved preview."
+        } : {
+          state: "ambiguous",
+          message: "The provider accepted the writes, but the read-back content differs from the preview."
+        }
+      };
+    } catch (error51) {
+      const appError = error51 instanceof AppError ? error51 : new AppError("PROVIDER_INDETERMINATE", "The provider write outcome could not be determined.", {
+        cause: error51
+      });
+      const details = typeof appError.details === "object" && appError.details !== null ? appError.details : {};
+      const status = providerMutationReturned ? "indeterminate" : appError.code === "CONFLICT" ? "conflict" : appError.code === "PROVIDER_PARTIAL" ? "partial" : appError.code === "PROVIDER_INDETERMINATE" || appError.code === "PROVIDER_ERROR" ? "indeterminate" : "failed";
+      result = {
+        operationId,
+        status,
+        ...typeof details.tripId === "string" ? { tripId: details.tripId } : {},
+        ...typeof details.completedSteps === "number" ? { completedSteps: details.completedSteps } : {},
+        ...typeof details.totalSteps === "number" ? { totalSteps: details.totalSteps } : {},
+        reconciliation: {
+          state: "ambiguous",
+          message: safeReconciliationMessage(providerMutationReturned ? "PROVIDER_INDETERMINATE" : appError.code)
+        }
+      };
+    }
+    await this.store.update((currentState) => {
+      const ledger = currentState.ledger[request.idempotencyKey];
+      if (!ledger)
+        return;
+      ledger.status = result.status === "applied" || result.status === "already_applied" ? "applied" : result.status === "partial" ? "partial" : result.status === "indeterminate" ? "indeterminate" : "failed";
+      ledger.result = result;
+      ledger.updatedAt = new Date().toISOString();
+    });
+    return result;
+  }
+}
+
+// src/app.ts
+function createAppContext(options = {}) {
+  const config2 = options.config ?? loadConfig();
+  const session = new BrowserSession(config2);
+  const transport = options.transport ?? new BrowserChicTripTransport(session, config2);
+  const store = new JsonStateStore(config2.stateDir);
+  const approval = new ApprovalService(store, config2.approvalTtlMs);
+  const service = new TripService(transport, store, approval, config2);
+  return { config: config2, session, transport, store, approval, service };
+}
+
 // node_modules/zod/v3/helpers/util.js
 var util;
 (function(util2) {
@@ -27564,7 +30052,7 @@ class Protocol {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1000;
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+        await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -27576,7 +30064,7 @@ class Protocol {
   }
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -27654,7 +30142,7 @@ class Protocol {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve(parseResult.data);
+            resolve2(parseResult.data);
           }
         } catch (error51) {
           reject(error51);
@@ -27845,12 +30333,12 @@ class Protocol {
         interval = task.pollInterval;
       }
     } catch {}
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve, interval);
+      const timeoutId = setTimeout(resolve2, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -28704,7 +31192,7 @@ class McpServer {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5000;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -29242,2494 +31730,6 @@ var EMPTY_COMPLETION_RESULT = {
   }
 };
 
-// src/config.ts
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-function envFlag(value) {
-  return value === "1" || value?.toLowerCase() === "true";
-}
-function loadConfig(env = process.env) {
-  const stateDir = resolve(env.CHICTRIP_STATE_DIR ?? join(homedir(), ".local", "share", "chictrip-agent"));
-  return {
-    stateDir,
-    browserProfileDir: resolve(env.CHICTRIP_BROWSER_PROFILE_DIR ?? join(stateDir, "browser-profile")),
-    browserChannel: env.CHICTRIP_BROWSER_CHANNEL ?? "chrome",
-    enableUndocumentedWrites: envFlag(env.CHICTRIP_ENABLE_UNDOCUMENTED_WRITES),
-    enableExperimentalItemAdds: envFlag(env.CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS),
-    previewTtlMs: 15 * 60000,
-    approvalTtlMs: 5 * 60000,
-    apiBaseUrl: "https://api.chictrip.com.tw/",
-    providerClientVersion: env.CHICTRIP_PROVIDER_CLIENT_VERSION ?? "2.0.38",
-    siteUrl: "https://www.chictrip.com.tw/landing",
-    httpHost: env.CHICTRIP_MCP_HOST ?? "127.0.0.1",
-    httpPort: Number.parseInt(env.CHICTRIP_MCP_PORT ?? "3333", 10),
-    ...env.CHICTRIP_MCP_BEARER_TOKEN ? { httpBearerToken: env.CHICTRIP_MCP_BEARER_TOKEN } : {}
-  };
-}
-
-// src/auth/browser-session.ts
-import { chmod, mkdir } from "node:fs/promises";
-import {
-  chromium
-} from "playwright-core";
-
-// src/domain/errors.ts
-class AppError extends Error {
-  code;
-  retryable;
-  details;
-  constructor(code, message, options = {}) {
-    super(message, { cause: options.cause });
-    this.name = "AppError";
-    this.code = code;
-    this.retryable = options.retryable ?? false;
-    this.details = options.details;
-  }
-}
-
-// src/auth/browser-session.ts
-async function readBrowserAuthStatusInPage() {
-  const accessToken = window.localStorage.getItem("accessToken");
-  const memberId = window.localStorage.getItem("memberId");
-  if (!accessToken || !memberId)
-    return { authenticated: false };
-  try {
-    const parts = accessToken.split(".");
-    if (parts.length !== 3 || !parts[1])
-      return { authenticated: false };
-    const encoded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
-    const payload = JSON.parse(window.atob(padded));
-    if (String(payload.sub ?? "") !== memberId) {
-      return { authenticated: false };
-    }
-  } catch {
-    return { authenticated: false };
-  }
-  const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(memberId));
-  if (window.localStorage.getItem("memberId") !== memberId || window.localStorage.getItem("accessToken") !== accessToken) {
-    return { authenticated: false };
-  }
-  const accountRefHash = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return { authenticated: true, accountRefHash };
-}
-
-class BrowserSession {
-  config;
-  operationTail = Promise.resolve();
-  constructor(config2) {
-    this.config = config2;
-  }
-  async status() {
-    return this.withPage(true, (page) => this.readAuthStatus(page));
-  }
-  async login(options = {}) {
-    const timeoutMs = options.timeoutMs ?? 10 * 60000;
-    return this.withPage(false, async (page, context) => {
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline) {
-        const candidates = context.pages().filter((candidate) => !candidate.isClosed() && candidate.url().startsWith("https://www.chictrip.com.tw/"));
-        if (candidates.length === 0 && !page.isClosed() && page.url().startsWith("https://www.chictrip.com.tw/")) {
-          candidates.push(page);
-        }
-        for (const candidate of candidates) {
-          try {
-            const status = await this.readAuthStatus(candidate);
-            if (status.authenticated)
-              return status;
-          } catch (error51) {
-            if (!this.isTransientNavigationError(error51))
-              throw error51;
-          }
-        }
-        await new Promise((resolve2) => setTimeout(resolve2, 1000));
-      }
-      throw new AppError("AUTH_REQUIRED", "Timed out waiting for chicTrip login. Run the login command again.");
-    });
-  }
-  async withAuthenticatedPage(callback) {
-    return this.withPage(true, async (page) => {
-      const status = await this.readAuthStatus(page);
-      if (!status.authenticated) {
-        throw new AppError("AUTH_REQUIRED", "chicTrip login is required. Run `chictrip auth login` locally first.");
-      }
-      return callback(page);
-    });
-  }
-  async withPage(headless, callback) {
-    const previous = this.operationTail;
-    let release;
-    this.operationTail = new Promise((resolve2) => {
-      release = resolve2;
-    });
-    await previous;
-    try {
-      return await this.withExclusivePage(headless, callback);
-    } finally {
-      release();
-    }
-  }
-  async withExclusivePage(headless, callback) {
-    await mkdir(this.config.browserProfileDir, { recursive: true, mode: 448 });
-    await chmod(this.config.browserProfileDir, 448);
-    let context;
-    try {
-      context = await chromium.launchPersistentContext(this.config.browserProfileDir, {
-        channel: this.config.browserChannel,
-        headless,
-        viewport: { width: 1280, height: 900 }
-      });
-    } catch (error51) {
-      throw new AppError("AUTH_REQUIRED", `Unable to launch the dedicated chicTrip browser profile with channel "${this.config.browserChannel}".`, {
-        cause: error51,
-        details: {
-          hint: "Set CHICTRIP_BROWSER_CHANNEL to an installed Playwright browser channel, such as chrome or msedge."
-        }
-      });
-    }
-    try {
-      const existing = context.pages()[0];
-      const page = existing ?? await context.newPage();
-      if (!page.url().startsWith("https://www.chictrip.com.tw/")) {
-        await page.goto(this.config.siteUrl, { waitUntil: "domcontentloaded" });
-      }
-      return await callback(page, context);
-    } finally {
-      await context.close();
-    }
-  }
-  async readAuthStatus(page) {
-    return page.evaluate(readBrowserAuthStatusInPage);
-  }
-  isTransientNavigationError(error51) {
-    const message = error51 instanceof Error ? error51.message : String(error51);
-    return message.includes("Execution context was destroyed") || message.includes("Cannot find context with specified id") || message.includes("Target page, context or browser has been closed");
-  }
-}
-
-// src/provider/browser-api.ts
-var ALLOWED_ENDPOINTS = new Set([
-  "/Location/SearchV2",
-  "/PoiSearch/SearchByKeyword",
-  "/TravelSchedule/GetMyAndCollaboration",
-  "/TravelSchedule/GetSystemCoverList",
-  "/TravelScheduleUserLabel/Get",
-  "/TravelSchedule/AddV2",
-  "/TravelSchedule/UpdateV3",
-  "/TravelScheduleDetail/Get",
-  "/TravelScheduleDetail/GetAddWhere",
-  "/TravelScheduleDetail/Add",
-  "/TravelScheduleDetail/GetEditInfo",
-  "/TravelScheduleDetail/Update",
-  "/TravelScheduleDetail/Delete",
-  "/TravelScheduleDetail/Sort",
-  "/TravelScheduleDetail/VerifyUpdateTime"
-]);
-function serializeProviderEntries(values) {
-  const output = [];
-  for (const [key, value] of Object.entries(values)) {
-    if (value === undefined || value === null)
-      continue;
-    const isArray = Array.isArray(value);
-    const entries = isArray ? value : [value];
-    const wireKey = isArray ? `${key}[]` : key;
-    for (const entry of entries) {
-      output.push([
-        wireKey,
-        typeof entry === "object" && entry !== null ? JSON.stringify(entry) : String(entry)
-      ]);
-    }
-  }
-  return output;
-}
-async function requestInBrowserPage(input) {
-  const unauthorized = () => ({
-    httpStatus: 401,
-    envelope: { apiStatus: "003", data: null, message: null }
-  });
-  const accountMismatch = () => ({
-    httpStatus: 409,
-    accountMismatch: true,
-    envelope: { apiStatus: "", data: null, message: null }
-  });
-  const tokenSubject = (accessToken) => {
-    try {
-      const parts = accessToken.split(".");
-      if (parts.length !== 3 || !parts[1])
-        return;
-      const encoded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-      const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
-      const payload = JSON.parse(window.atob(padded));
-      return payload.sub === undefined ? undefined : String(payload.sub);
-    } catch {
-      return;
-    }
-  };
-  const captureCredentials = () => {
-    const memberId = window.localStorage.getItem("memberId");
-    const accessToken = window.localStorage.getItem("accessToken");
-    if (!memberId || !accessToken)
-      return;
-    return {
-      memberId,
-      accessToken,
-      refreshToken: window.localStorage.getItem("refreshToken")
-    };
-  };
-  const snapshotIsCurrent = (snapshot2) => window.localStorage.getItem("memberId") === snapshot2.memberId && window.localStorage.getItem("accessToken") === snapshot2.accessToken && window.localStorage.getItem("refreshToken") === snapshot2.refreshToken;
-  const credentialsMatch = async (snapshot2) => {
-    if (tokenSubject(snapshot2.accessToken) !== snapshot2.memberId)
-      return false;
-    if (input.expectedAccountRefHash) {
-      const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(snapshot2.memberId));
-      const actual = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-      if (actual !== input.expectedAccountRefHash)
-        return false;
-    }
-    return snapshotIsCurrent(snapshot2);
-  };
-  const perform = async (accessToken) => {
-    const url2 = new URL(input.path, input.apiBaseUrl);
-    if (input.queryEntries) {
-      for (const [key, value] of input.queryEntries) {
-        url2.searchParams.append(key, value);
-      }
-    }
-    const headers = new Headers({
-      Authorization: `Bearer ${accessToken}`,
-      osType: "web",
-      language: input.language ?? "zhtw",
-      version: input.providerClientVersion
-    });
-    let body;
-    if (input.body || input.bodyEntries) {
-      if (input.bodyEncoding === "form") {
-        const form = new URLSearchParams;
-        for (const [key, value] of input.bodyEntries ?? []) {
-          form.append(key, value);
-        }
-        body = form;
-        headers.set("Content-Type", "application/x-www-form-urlencoded");
-      } else if (input.bodyEncoding === "json") {
-        body = JSON.stringify(input.body);
-        headers.set("Content-Type", "application/json");
-      } else {
-        const form = new FormData;
-        for (const [key, value] of input.bodyEntries ?? []) {
-          form.append(key, value);
-        }
-        body = form;
-      }
-    }
-    const response = await window.fetch(url2, {
-      method: input.method,
-      headers,
-      ...body ? { body } : {}
-    });
-    const raw = await response.json();
-    const apiStatus = String(raw.apiStatus ?? raw.ApiStatus ?? "");
-    return {
-      httpStatus: response.status,
-      envelope: {
-        apiStatus,
-        data: raw.data,
-        message: typeof raw.message === "string" ? raw.message : null
-      }
-    };
-  };
-  const snapshot = captureCredentials();
-  if (!snapshot)
-    return unauthorized();
-  if (!await credentialsMatch(snapshot)) {
-    return input.expectedAccountRefHash ? accountMismatch() : unauthorized();
-  }
-  let result = await perform(snapshot.accessToken);
-  if (result.envelope.apiStatus !== "003" || !snapshot.refreshToken) {
-    return result;
-  }
-  const refreshBody = new FormData;
-  refreshBody.append("refreshToken", snapshot.refreshToken);
-  refreshBody.append("memberId", snapshot.memberId);
-  const refreshResponse = await window.fetch(new URL("/Token/Refresh", input.apiBaseUrl), {
-    method: "POST",
-    headers: {
-      osType: "web",
-      language: "zhtw",
-      version: input.providerClientVersion
-    },
-    body: refreshBody
-  });
-  const refreshRaw = await refreshResponse.json();
-  const refreshStatus = String(refreshRaw.apiStatus ?? refreshRaw.ApiStatus ?? "");
-  const refreshData = typeof refreshRaw.data === "object" && refreshRaw.data !== null ? refreshRaw.data : {};
-  if (refreshStatus !== "001" || typeof refreshData.accessToken !== "string") {
-    return result;
-  }
-  const refreshedAccessToken = refreshData.accessToken;
-  const refreshedMemberId = typeof refreshData.memberId === "string" ? refreshData.memberId : snapshot.memberId;
-  if (refreshedMemberId !== snapshot.memberId || tokenSubject(refreshedAccessToken) !== snapshot.memberId || !snapshotIsCurrent(snapshot)) {
-    return input.expectedAccountRefHash ? accountMismatch() : unauthorized();
-  }
-  window.localStorage.setItem("accessToken", refreshedAccessToken);
-  if (typeof refreshData.refreshToken === "string") {
-    window.localStorage.setItem("refreshToken", refreshData.refreshToken);
-  }
-  window.localStorage.setItem("memberId", refreshedMemberId);
-  result = await perform(refreshedAccessToken);
-  return result;
-}
-
-class BrowserApiClient {
-  session;
-  config;
-  constructor(session, config2) {
-    this.session = session;
-    this.config = config2;
-  }
-  async request(request) {
-    if (!ALLOWED_ENDPOINTS.has(request.path)) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", `Provider endpoint is not allowlisted: ${request.path}`);
-    }
-    let pageEvaluationStarted = false;
-    let result;
-    try {
-      result = await this.session.withAuthenticatedPage((page) => {
-        pageEvaluationStarted = true;
-        return this.requestInPage(page, {
-          apiBaseUrl: this.config.apiBaseUrl,
-          providerClientVersion: this.config.providerClientVersion,
-          method: request.method,
-          path: request.path,
-          ...request.expectedAccountRefHash ? { expectedAccountRefHash: request.expectedAccountRefHash } : {},
-          ...request.language ? { language: request.language } : {},
-          ...request.query ? { queryEntries: serializeProviderEntries(request.query) } : {},
-          ...request.body && request.bodyEncoding === "json" ? { body: request.body } : request.body ? { bodyEntries: serializeProviderEntries(request.body) } : {},
-          ...request.bodyEncoding ? { bodyEncoding: request.bodyEncoding } : {}
-        });
-      });
-    } catch (error51) {
-      if (request.method !== "GET" && pageEvaluationStarted) {
-        throw new AppError("PROVIDER_INDETERMINATE", "A chicTrip mutation may have been sent, but no parseable provider response was received.", { cause: error51 });
-      }
-      throw error51;
-    }
-    if (result.accountMismatch) {
-      throw new AppError("APPROVAL_INVALID", "The authenticated chicTrip account changed before the provider request.");
-    }
-    const accepted = request.acceptedStatuses ?? ["001"];
-    if (!accepted.includes(result.envelope.apiStatus)) {
-      if (result.envelope.apiStatus === "003") {
-        throw new AppError("AUTH_REQUIRED", "The chicTrip browser session is no longer authenticated.");
-      }
-      if (result.envelope.apiStatus === "004") {
-        throw new AppError("CONFLICT", "chicTrip reports a newer itinerary revision.", {
-          details: { providerStatus: result.envelope.apiStatus }
-        });
-      }
-      if (result.envelope.apiStatus === "006") {
-        throw new AppError("CONFLICT", "This account no longer has permission to edit the itinerary.", { details: { providerStatus: result.envelope.apiStatus } });
-      }
-      throw new AppError("PROVIDER_ERROR", result.envelope.message || `chicTrip returned status ${result.envelope.apiStatus}.`, {
-        retryable: result.httpStatus >= 500,
-        details: {
-          providerStatus: result.envelope.apiStatus,
-          httpStatus: result.httpStatus
-        }
-      });
-    }
-    return result.envelope;
-  }
-  async requestInPage(page, request) {
-    return page.evaluate(requestInBrowserPage, request);
-  }
-}
-
-// src/domain/schemas.ts
-var IsoDateSchema = exports_external.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected a date in YYYY-MM-DD format.").refine((value) => {
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
-}, "Expected a real calendar date.");
-var IsoDateTimeSchema = exports_external.iso.datetime({ offset: true });
-var TripRevisionSchema = exports_external.object({
-  providerVersion: exports_external.string().optional(),
-  contentHash: exports_external.string().min(16),
-  readAt: IsoDateTimeSchema
-});
-var DestinationSchema = exports_external.object({
-  providerLocationKey: exports_external.string().min(1),
-  name: exports_external.string().min(1).max(120)
-});
-var PlaceRefSchema = exports_external.object({
-  providerPlaceId: exports_external.string().min(1),
-  name: exports_external.string().min(1).max(200),
-  latitude: exports_external.number().finite().optional(),
-  longitude: exports_external.number().finite().optional(),
-  coverMediaId: exports_external.string().min(1).optional()
-});
-var TripItemSchema = exports_external.object({
-  id: exports_external.string().optional(),
-  place: PlaceRefSchema,
-  startsAt: IsoDateTimeSchema.optional(),
-  durationMinutes: exports_external.number().int().min(0).max(1440).optional(),
-  note: exports_external.string().max(2000).optional(),
-  categoryId: exports_external.string().min(1).optional()
-});
-var TripDaySchema = exports_external.object({
-  date: IsoDateSchema,
-  items: exports_external.array(TripItemSchema).max(80)
-});
-var TrafficTypeSchema = exports_external.enum([
-  "Walking",
-  "Driving",
-  "Transit",
-  "TwoWheeler",
-  "Custom"
-]);
-var TripDraftSchema = exports_external.object({
-  title: exports_external.string().trim().min(1).max(100),
-  startDate: IsoDateSchema,
-  endDate: IsoDateSchema,
-  timezone: exports_external.string().default("Asia/Taipei"),
-  destinations: exports_external.array(DestinationSchema).min(1).max(20),
-  trafficType: TrafficTypeSchema.default("Custom"),
-  days: exports_external.array(TripDaySchema).min(1).max(60)
-}).superRefine((draft, context) => {
-  const start = Date.parse(`${draft.startDate}T00:00:00Z`);
-  const end = Date.parse(`${draft.endDate}T00:00:00Z`);
-  if (end < start) {
-    context.addIssue({
-      code: "custom",
-      path: ["endDate"],
-      message: "endDate must not be earlier than startDate."
-    });
-  }
-  const expectedDays = Math.floor((end - start) / 86400000) + 1;
-  if (expectedDays > 60) {
-    context.addIssue({
-      code: "custom",
-      path: ["endDate"],
-      message: "chicTrip itineraries are limited to 60 days."
-    });
-  }
-  const uniqueDates = new Set(draft.days.map((day) => day.date));
-  if (uniqueDates.size !== draft.days.length) {
-    context.addIssue({
-      code: "custom",
-      path: ["days"],
-      message: "Each itinerary day must have a unique date."
-    });
-  }
-  if (Number.isFinite(expectedDays) && expectedDays > 0) {
-    if (draft.days.length !== expectedDays) {
-      context.addIssue({
-        code: "custom",
-        path: ["days"],
-        message: `days must contain exactly one entry for each trip date (${expectedDays} total).`
-      });
-    }
-    for (let offset = 0;offset < expectedDays; offset += 1) {
-      const date6 = new Date(start + offset * 86400000).toISOString().slice(0, 10);
-      if (!uniqueDates.has(date6)) {
-        context.addIssue({
-          code: "custom",
-          path: ["days"],
-          message: `Missing itinerary day: ${date6}`
-        });
-      }
-      if (draft.days[offset]?.date !== date6) {
-        context.addIssue({
-          code: "custom",
-          path: ["days", offset, "date"],
-          message: `Itinerary days must be ordered chronologically; expected ${date6}.`
-        });
-      }
-    }
-  }
-  for (const [index, day] of draft.days.entries()) {
-    if (day.date < draft.startDate || day.date > draft.endDate) {
-      context.addIssue({
-        code: "custom",
-        path: ["days", index, "date"],
-        message: "Itinerary day is outside the trip date range."
-      });
-    }
-  }
-});
-var TripSummarySchema = exports_external.object({
-  id: exports_external.string(),
-  title: exports_external.string(),
-  startDate: IsoDateSchema,
-  endDate: IsoDateSchema,
-  ownership: exports_external.enum(["owned", "collaborating"]),
-  permission: exports_external.enum(["owner", "editor", "viewer", "unknown"]),
-  destinationNames: exports_external.array(exports_external.string()),
-  providerVersion: exports_external.string().optional()
-});
-var TripRecordSchema = TripDraftSchema.extend({
-  id: exports_external.string(),
-  ownership: exports_external.enum(["owned", "collaborating"]),
-  permission: exports_external.enum(["owner", "editor", "viewer", "unknown"]),
-  revision: TripRevisionSchema
-});
-var SetTripFieldsOperationSchema = exports_external.object({
-  op: exports_external.literal("set_trip_fields"),
-  fields: exports_external.object({
-    title: exports_external.string().trim().min(1).max(100).optional(),
-    startDate: IsoDateSchema.optional(),
-    endDate: IsoDateSchema.optional(),
-    destinations: exports_external.array(DestinationSchema).min(1).max(20).optional(),
-    trafficType: TrafficTypeSchema.optional()
-  }).refine((fields) => Object.keys(fields).length > 0, "At least one field is required.")
-});
-var AddItemOperationSchema = exports_external.object({
-  op: exports_external.literal("add_item"),
-  date: IsoDateSchema,
-  item: TripItemSchema.omit({ id: true }),
-  afterItemId: exports_external.string().optional()
-});
-var UpdateItemOperationSchema = exports_external.object({
-  op: exports_external.literal("update_item"),
-  itemId: exports_external.string().min(1),
-  fields: exports_external.object({
-    name: exports_external.string().min(1).max(200).optional(),
-    startsAt: IsoDateTimeSchema.nullable().optional(),
-    durationMinutes: exports_external.number().int().min(0).max(1440).optional(),
-    note: exports_external.string().max(2000).nullable().optional(),
-    categoryId: exports_external.string().min(1).nullable().optional()
-  }).refine((fields) => Object.keys(fields).length > 0, "At least one field is required.")
-});
-var MoveItemOperationSchema = exports_external.object({
-  op: exports_external.literal("move_item"),
-  itemId: exports_external.string().min(1),
-  toDate: IsoDateSchema,
-  afterItemId: exports_external.string().optional()
-});
-var RemoveItemOperationSchema = exports_external.object({
-  op: exports_external.literal("remove_item"),
-  itemId: exports_external.string().min(1)
-});
-var TripPatchOperationSchema = exports_external.discriminatedUnion("op", [
-  SetTripFieldsOperationSchema,
-  AddItemOperationSchema,
-  UpdateItemOperationSchema,
-  MoveItemOperationSchema,
-  RemoveItemOperationSchema
-]);
-var CreateTripChangeIntentSchema = exports_external.object({
-  kind: exports_external.literal("create"),
-  desired: TripDraftSchema
-});
-var UpdateTripChangeIntentSchema = exports_external.object({
-  kind: exports_external.literal("update"),
-  tripId: exports_external.string().min(1),
-  baseRevision: TripRevisionSchema,
-  operations: exports_external.array(TripPatchOperationSchema).min(1).max(200)
-});
-var TripChangeIntentSchema = exports_external.discriminatedUnion("kind", [
-  CreateTripChangeIntentSchema,
-  UpdateTripChangeIntentSchema
-]);
-var ApplyTripChangeInputSchema = exports_external.object({
-  previewId: exports_external.uuid(),
-  intentHash: exports_external.string().min(16),
-  idempotencyKey: exports_external.uuid()
-});
-var ListTripsInputSchema = exports_external.object({
-  scope: exports_external.enum(["all", "owned", "collaborating"]).default("all"),
-  limit: exports_external.number().int().min(1).max(100).default(50)
-});
-var SearchPlacesInputSchema = exports_external.object({
-  query: exports_external.string().trim().min(1).max(200),
-  centerLatitude: exports_external.number().finite().min(-90).max(90).optional(),
-  centerLongitude: exports_external.number().finite().min(-180).max(180).optional(),
-  limit: exports_external.number().int().min(1).max(30).default(10)
-});
-var SearchDestinationsInputSchema = exports_external.object({
-  query: exports_external.string().trim().min(1).max(100),
-  limit: exports_external.number().int().min(1).max(30).default(10)
-});
-
-// src/domain/canonical.ts
-import { createHash } from "node:crypto";
-function canonicalize(value) {
-  if (value === null || typeof value !== "object")
-    return JSON.stringify(value);
-  if (Array.isArray(value))
-    return `[${value.map(canonicalize).join(",")}]`;
-  const object4 = value;
-  return `{${Object.keys(object4).filter((key) => object4[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(object4[key])}`).join(",")}}`;
-}
-function sha256(value) {
-  return createHash("sha256").update(canonicalize(value)).digest("hex");
-}
-function floatingDateTime(value) {
-  const match = value.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
-  return match?.[1] && match[2] ? `${match[1]}T${match[2]}+00:00` : value;
-}
-function tripContent(trip) {
-  return {
-    title: trip.title,
-    startDate: trip.startDate,
-    endDate: trip.endDate,
-    timezone: "provider-floating-local-time",
-    destinations: trip.destinations.map((destination) => ({
-      providerLocationKey: destination.providerLocationKey,
-      name: ""
-    })).sort((left, right) => left.providerLocationKey.localeCompare(right.providerLocationKey)),
-    trafficType: trip.trafficType,
-    days: trip.days.map((day) => ({
-      date: day.date,
-      items: day.items.map((item) => ({
-        place: {
-          providerPlaceId: item.place.providerPlaceId,
-          name: item.place.name,
-          ...item.place.coverMediaId ? { coverMediaId: item.place.coverMediaId } : {}
-        },
-        ...item.startsAt ? {
-          startsAt: floatingDateTime(item.startsAt)
-        } : {},
-        durationMinutes: item.durationMinutes ?? 0,
-        ...item.note ? { note: item.note } : {},
-        ...item.categoryId ? { categoryId: item.categoryId } : {}
-      }))
-    })).sort((left, right) => left.date.localeCompare(right.date))
-  };
-}
-function tripContentHash(trip) {
-  return sha256(tripContent(trip));
-}
-function tripMatchesDesired(actual, desired) {
-  const actualContent = tripContent(actual);
-  const desiredContent = tripContent(desired);
-  const projectedActual = structuredClone(actualContent);
-  for (const [dayIndex, desiredDay] of desiredContent.days.entries()) {
-    const actualDay = projectedActual.days[dayIndex];
-    if (!actualDay || actualDay.date !== desiredDay.date)
-      continue;
-    for (const [itemIndex, desiredItem] of desiredDay.items.entries()) {
-      const actualItem = actualDay.items[itemIndex];
-      if (!actualItem)
-        continue;
-      if (desiredItem.place.coverMediaId === undefined) {
-        delete actualItem.place.coverMediaId;
-      }
-      if (desiredItem.categoryId === undefined) {
-        delete actualItem.categoryId;
-      }
-    }
-  }
-  return canonicalize(projectedActual) === canonicalize(desiredContent);
-}
-
-// src/provider/normalize.ts
-function asRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
-}
-function asArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-function pickString(object4, ...keys) {
-  for (const key of keys) {
-    const value = object4[key];
-    if (typeof value === "string" && value.length > 0)
-      return value;
-    if (typeof value === "number" && Number.isFinite(value))
-      return String(value);
-  }
-  return;
-}
-function pickNumber(object4, ...keys) {
-  for (const key of keys) {
-    const value = object4[key];
-    if (typeof value === "number" && Number.isFinite(value))
-      return value;
-    if (typeof value === "string" && value.trim() !== "") {
-      const number5 = Number(value);
-      if (Number.isFinite(number5))
-        return number5;
-    }
-  }
-  return;
-}
-function normalizeDate(value) {
-  if (typeof value !== "string")
-    return "1970-01-01";
-  const match = value.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : "1970-01-01";
-}
-function providerDate(value) {
-  return value.replaceAll("-", "/");
-}
-function dateAtOffset(startDate, offset) {
-  const date6 = new Date(`${startDate}T00:00:00Z`);
-  date6.setUTCDate(date6.getUTCDate() + offset);
-  return date6.toISOString().slice(0, 10);
-}
-function dayNumber(startDate, date6) {
-  const start = Date.parse(`${startDate}T00:00:00Z`);
-  const target = Date.parse(`${date6}T00:00:00Z`);
-  return Math.floor((target - start) / 86400000) + 1;
-}
-function totalDays(startDate, endDate) {
-  return dayNumber(startDate, endDate);
-}
-function extractTripRoot(data, tripId) {
-  if (!Array.isArray(data))
-    return asRecord(data);
-  const records = data.map(asRecord);
-  if (tripId) {
-    const match = records.find((candidate) => {
-      const info = asRecord(candidate.travelScheduleInfo);
-      return pickString(info, "id", "Id") === tripId;
-    });
-    if (match)
-      return match;
-  }
-  return records[0] ?? {};
-}
-function normalizePermission(permission) {
-  if (typeof permission !== "string")
-    return "unknown";
-  const normalized = permission.toLowerCase();
-  return normalized === "owner" || normalized === "editor" || normalized === "viewer" ? normalized : "unknown";
-}
-function normalizeOwnership(permission) {
-  return normalizePermission(permission) === "owner" ? "owned" : "collaborating";
-}
-function normalizeDestinations(value) {
-  return asArray(value).map(asRecord).map((destination) => ({
-    providerLocationKey: pickString(destination, "locationKey", "LocationKey", "id", "Id") ?? "",
-    name: pickString(destination, "locationName", "name", "Name", "title") ?? ""
-  })).filter((destination) => destination.providerLocationKey && destination.name).map((destination) => DestinationSchema.parse(destination));
-}
-function normalizeTripSummary(raw) {
-  const record3 = asRecord(raw);
-  const destinations = normalizeDestinations(record3.destinationList);
-  const startDate = normalizeDate(record3.startDate ?? record3.StartDate);
-  const endDate = normalizeDate(record3.endDate ?? record3.EndDate);
-  return TripSummarySchema.parse({
-    id: pickString(record3, "id", "Id") ?? "",
-    title: pickString(record3, "name", "Name") ?? "Untitled trip",
-    startDate,
-    endDate,
-    ownership: normalizeOwnership(record3.permission),
-    permission: normalizePermission(record3.permission),
-    destinationNames: destinations.map((destination) => destination.name),
-    providerVersion: pickString(record3, "updateTime", "UpdateTime")
-  });
-}
-function normalizeStartsAt(raw, itineraryDate) {
-  const customFlag = raw.isUseCustomArrivalTime === true || raw.IsUseCustomArrivalTime === true || pickNumber(raw, "isUseCustomArrivalTime", "IsUseCustomArrivalTime") === 1;
-  if (!customFlag)
-    return;
-  const candidate = pickString(raw, "customArrivalTime", "CustomArrivalTime");
-  if (!candidate)
-    return;
-  const time3 = candidate.match(/(?:T|\s)(\d{2}:\d{2}(?::\d{2})?)/)?.[1];
-  if (!time3)
-    return;
-  const normalized = `${itineraryDate}T${time3.length === 5 ? `${time3}:00` : time3}`;
-  const withOffset = /(?:Z|[+-]\d{2}:\d{2})$/.test(normalized) ? normalized : `${normalized}+08:00`;
-  const parsed = Date.parse(withOffset);
-  return Number.isFinite(parsed) ? withOffset : undefined;
-}
-function normalizeItem(raw, itineraryDate) {
-  const record3 = asRecord(raw);
-  const nestedPoi = asRecord(record3.poi);
-  const cover = asRecord(record3.cover);
-  const id = pickString(record3, "tsdId", "TsdId", "travelScheduleDetailId", "id", "Id") ?? "";
-  const providerPlaceId = pickString(record3, "poiId", "PoiId", "placeId") ?? pickString(nestedPoi, "id", "Id") ?? `unknown:${id}`;
-  const place = PlaceRefSchema.parse({
-    providerPlaceId,
-    name: pickString(record3, "name", "Name", "tsdName", "TsdName") ?? pickString(nestedPoi, "name", "Name") ?? "Untitled place",
-    latitude: pickNumber(record3, "latitude", "Latitude", "lat") ?? pickNumber(nestedPoi, "latitude", "Latitude", "lat"),
-    longitude: pickNumber(record3, "longitude", "Longitude", "lon", "lng") ?? pickNumber(nestedPoi, "longitude", "Longitude", "lon", "lng"),
-    coverMediaId: pickString(record3, "coverMediaId", "TsdCoverMediaId") ?? pickString(cover, "id", "Id")
-  });
-  const startsAt = normalizeStartsAt(record3, itineraryDate);
-  const durationMinutes = pickNumber(record3, "stayTime", "StayTime");
-  const note = pickString(record3, "note", "Note");
-  const categoryId = pickString(record3, "poiClassificationId", "PoiClassificationId");
-  return {
-    ...id ? { id } : {},
-    place,
-    ...startsAt ? { startsAt } : {},
-    ...durationMinutes !== undefined ? { durationMinutes } : {},
-    ...note ? { note } : {},
-    ...categoryId ? { categoryId } : {}
-  };
-}
-function normalizeTrip(data, tripId) {
-  const root = extractTripRoot(data, tripId);
-  const infoCandidate = asRecord(root.travelScheduleInfo);
-  const info = Object.keys(infoCandidate).length > 0 ? infoCandidate : root;
-  const id = pickString(info, "id", "Id") ?? tripId ?? "";
-  const startDate = normalizeDate(info.startDate ?? info.StartDate);
-  const endDate = normalizeDate(info.endDate ?? info.EndDate);
-  const rawDays = asArray(root.dayList).length > 0 ? asArray(root.dayList) : asArray(root.days).length > 0 ? asArray(root.days) : asArray(root.travelScheduleDayList);
-  const days = rawDays.map((rawDay, index) => {
-    const day = asRecord(rawDay);
-    const dayIndex = (pickNumber(day, "day", "Day") ?? index + 1) - 1;
-    const date6 = normalizeDate(day.date ?? day.Date) !== "1970-01-01" ? normalizeDate(day.date ?? day.Date) : dateAtOffset(startDate, dayIndex);
-    const itemsSource = asArray(day.tsdList).length > 0 ? asArray(day.tsdList) : asArray(day.travelScheduleDetailList).length > 0 ? asArray(day.travelScheduleDetailList) : asArray(day.detailList).length > 0 ? asArray(day.detailList) : asArray(day.items);
-    return {
-      date: date6,
-      items: itemsSource.map((item) => normalizeItem(item, date6))
-    };
-  });
-  const numberOfDays = Math.max(1, totalDays(startDate, endDate));
-  const byDate = new Map(days.map((day) => [day.date, day]));
-  const completeDays = Array.from({ length: numberOfDays }, (_, index) => {
-    const date6 = dateAtOffset(startDate, index);
-    return byDate.get(date6) ?? { date: date6, items: [] };
-  });
-  const base = {
-    id,
-    title: pickString(info, "name", "Name") ?? "Untitled trip",
-    startDate,
-    endDate,
-    timezone: "Asia/Taipei",
-    destinations: normalizeDestinations(info.destinationList),
-    trafficType: TrafficTypeSchema.safeParse(pickString(info, "trafficType", "TrafficType")).data ?? "Custom",
-    days: completeDays,
-    ownership: normalizeOwnership(info.permission),
-    permission: normalizePermission(info.permission)
-  };
-  return TripRecordSchema.parse({
-    ...base,
-    revision: {
-      providerVersion: pickString(info, "updateTime", "UpdateTime"),
-      contentHash: tripContentHash(base),
-      readAt: new Date().toISOString()
-    }
-  });
-}
-function normalizePlaceResults(data, limit) {
-  const root = asRecord(data);
-  const candidates = asArray(root.result).length > 0 ? asArray(root.result) : asArray(root.data).length > 0 ? asArray(root.data) : asArray(data);
-  return candidates.slice(0, limit).map(asRecord).map((place) => {
-    const cover = asRecord(place.cover);
-    return {
-      providerPlaceId: pickString(place, "poiId", "id", "Id") ?? "",
-      name: pickString(place, "name", "Name", "title") ?? "",
-      latitude: pickNumber(place, "latitude", "Latitude", "lat"),
-      longitude: pickNumber(place, "longitude", "Longitude", "lng", "lon"),
-      coverMediaId: pickString(place, "coverMediaId", "CoverMediaId") ?? pickString(cover, "id", "Id")
-    };
-  }).filter((place) => place.providerPlaceId && place.name).map((place) => PlaceRefSchema.parse(place));
-}
-function normalizeDestinationResults(data, limit) {
-  const root = asRecord(data);
-  const candidates = asArray(root.result).length > 0 ? asArray(root.result) : asArray(root.locationList).length > 0 ? asArray(root.locationList) : asArray(data);
-  return normalizeDestinations(candidates).slice(0, limit);
-}
-
-// src/transport/browser.ts
-function versionFrom(value) {
-  if (typeof value === "string" || typeof value === "number")
-    return String(value);
-  const record3 = asRecord(value);
-  return pickString(record3, "travelScheduleUpdateTime", "TravelScheduleUpdateTime", "updateTime", "UpdateTime");
-}
-function requireVersionFrom(value, operation) {
-  const version2 = versionFrom(value);
-  if (!version2) {
-    throw new AppError("PROVIDER_INDETERMINATE", `chicTrip did not return a new itinerary revision after ${operation}.`);
-  }
-  return version2;
-}
-function providerFlag(record3, ...keys) {
-  for (const key of keys) {
-    const value = record3[key];
-    if (value === true || value === 1 || value === "1")
-      return 1;
-    if (value === false || value === 0 || value === "0")
-      return 0;
-  }
-  return 0;
-}
-function providerWallClock(value) {
-  if (!value)
-    return "";
-  const match = value.match(/(?:T|\s|^)(\d{2}:\d{2})(?::(\d{2}))?/);
-  if (!match?.[1])
-    return "";
-  return `0001/01/01 ${match[1]}:${match[2] ?? "00"}`;
-}
-function addItemNeedsFollowUpUpdate(operation) {
-  return operation.item.startsAt !== undefined || operation.item.durationMinutes !== undefined || operation.item.categoryId !== undefined;
-}
-function plannedAddWrites(operation, current) {
-  let requiresSort = operation.afterItemId !== undefined;
-  if (operation.afterItemId && current) {
-    const day = current.days.find((candidate) => candidate.date === operation.date);
-    requiresSort = !day || day.items.at(-1)?.id !== operation.afterItemId;
-  }
-  return 1 + Number(addItemNeedsFollowUpUpdate(operation)) + Number(requiresSort);
-}
-function plannedWritesForOperations(current, operations) {
-  let startDate = current.startDate;
-  let endDate = current.endDate;
-  let layouts = current.days.map((day, dayIndex) => ({
-    date: day.date,
-    itemIds: day.items.map((item, itemIndex) => item.id ?? `missing:${dayIndex}:${itemIndex}`)
-  }));
-  let syntheticId = 0;
-  let writes = 0;
-  for (const operation of operations) {
-    if (operation.op === "add_item") {
-      const layout = layouts.find((day) => day.date === operation.date);
-      const requiresSort = operation.afterItemId !== undefined && layout?.itemIds.at(-1) !== operation.afterItemId;
-      writes += 1 + Number(addItemNeedsFollowUpUpdate(operation)) + Number(requiresSort);
-      if (layout) {
-        const newId = `planned-add:${syntheticId++}`;
-        if (operation.afterItemId) {
-          const anchorIndex = layout.itemIds.indexOf(operation.afterItemId);
-          layout.itemIds.splice(anchorIndex >= 0 ? anchorIndex + 1 : layout.itemIds.length, 0, newId);
-        } else {
-          layout.itemIds.push(newId);
-        }
-      }
-      continue;
-    }
-    writes += 1;
-    if (operation.op === "remove_item") {
-      for (const layout of layouts) {
-        const index = layout.itemIds.indexOf(operation.itemId);
-        if (index >= 0) {
-          layout.itemIds.splice(index, 1);
-          break;
-        }
-      }
-    } else if (operation.op === "move_item") {
-      const source = layouts.find((day) => day.itemIds.includes(operation.itemId));
-      const target = layouts.find((day) => day.date === operation.toDate);
-      if (source && target) {
-        source.itemIds.splice(source.itemIds.indexOf(operation.itemId), 1);
-        const anchorIndex = operation.afterItemId ? target.itemIds.indexOf(operation.afterItemId) : target.itemIds.length - 1;
-        target.itemIds.splice(anchorIndex + 1, 0, operation.itemId);
-      }
-    } else if (operation.op === "set_trip_fields") {
-      const nextStart = operation.fields.startDate ?? startDate;
-      const nextEnd = operation.fields.endDate ?? endDate;
-      if (totalDays(nextStart, nextEnd) === layouts.length) {
-        layouts = layouts.map((layout, index) => ({
-          date: dateAtOffset(nextStart, index),
-          itemIds: layout.itemIds
-        }));
-      }
-      startDate = nextStart;
-      endDate = nextEnd;
-    }
-  }
-  return writes;
-}
-function providerProgressDetails(tripId, completedSteps, totalSteps) {
-  return { tripId, completedSteps, totalSteps };
-}
-function requireAcceptedWriteVersion(value, operation, tripId, completedBefore, totalSteps) {
-  try {
-    return requireVersionFrom(value, operation);
-  } catch (error51) {
-    throw new AppError("PROVIDER_INDETERMINATE", `chicTrip accepted ${operation} but did not return a usable itinerary revision.`, {
-      cause: error51,
-      details: providerProgressDetails(tripId, completedBefore + 1, totalSteps)
-    });
-  }
-}
-function hasIndeterminateProgress(error51) {
-  return error51 instanceof AppError && error51.code === "PROVIDER_INDETERMINATE" && typeof error51.details === "object" && error51.details !== null;
-}
-async function requestMutation(api2, request, operation, tripId, completedBefore, totalSteps) {
-  try {
-    return await api2.request(request);
-  } catch (error51) {
-    if (hasIndeterminateProgress(error51))
-      throw error51;
-    if (error51 instanceof AppError && error51.code !== "PROVIDER_INDETERMINATE") {
-      throw error51;
-    }
-    throw new AppError("PROVIDER_INDETERMINATE", `${operation} may have reached chicTrip, but its outcome could not be determined.`, {
-      cause: error51,
-      details: providerProgressDetails(tripId, completedBefore + 1, totalSteps)
-    });
-  }
-}
-
-class BrowserChicTripTransport {
-  session;
-  config;
-  kind = "browser";
-  api;
-  constructor(session, config2, api2) {
-    this.session = session;
-    this.config = config2;
-    this.api = api2 ?? new BrowserApiClient(session, config2);
-  }
-  async getCapabilities() {
-    const status = await this.session.status();
-    const writes = this.config.enableUndocumentedWrites;
-    const addItems = writes && this.config.enableExperimentalItemAdds;
-    return {
-      transport: this.kind,
-      supportLevel: "experimental-undocumented",
-      authenticated: status.authenticated,
-      ...status.accountRefHash ? { accountRefHash: status.accountRefHash } : {},
-      read: {
-        listTrips: true,
-        getTrip: true,
-        searchPlaces: true,
-        searchDestinations: true
-      },
-      write: {
-        createTrip: writes,
-        updateTripFields: writes,
-        addItem: addItems,
-        updateItem: writes,
-        moveItem: writes,
-        removeItem: writes,
-        deleteTrip: false,
-        requiresApproval: true,
-        idempotency: "local-ledger",
-        atomicity: "multi-step"
-      },
-      caveats: [
-        "This adapter uses undocumented chicTrip web endpoints and may break when the vendor changes them.",
-        "No password, cookie, access token, or refresh token leaves the dedicated local browser profile.",
-        ...writes ? [] : [
-          "Writes are disabled. Set CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=1 only after reviewing the risks."
-        ],
-        ...addItems ? [
-          "Item adds use the currently observed p1 web-client flow and remain experimental."
-        ] : this.config.enableExperimentalItemAdds ? [
-          "Item adds remain disabled until CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=1 is also set."
-        ] : [
-          "Item adds require the separate CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=1 opt-in."
-        ],
-        "Moving itinerary items is limited to reordering within the same day."
-      ]
-    };
-  }
-  async listTrips(input) {
-    const response = await this.api.request({
-      method: "GET",
-      path: "/TravelSchedule/GetMyAndCollaboration",
-      query: { updateTime: 0, orderByColumn: "updatetime", sort: "desc" }
-    });
-    return asArray(response.data).map(normalizeTripSummary).filter((trip) => input.scope === "all" || trip.ownership === input.scope).slice(0, input.limit);
-  }
-  async getTrip(tripId) {
-    const trip = normalizeTrip(await this.rawTrip(tripId), tripId);
-    if (!trip.id)
-      throw new AppError("NOT_FOUND", `Trip not found: ${tripId}`);
-    return trip;
-  }
-  async searchPlaces(input) {
-    const response = await this.api.request({
-      method: "GET",
-      path: "/PoiSearch/SearchByKeyword",
-      query: {
-        keyword: input.query,
-        centerLatitude: input.centerLatitude ?? 25.0478,
-        centerLongitude: input.centerLongitude ?? 121.5319
-      }
-    });
-    return normalizePlaceResults(response.data, input.limit);
-  }
-  async searchDestinations(input) {
-    const response = await this.api.request({
-      method: "GET",
-      path: "/Location/SearchV2",
-      query: { key: input.query }
-    });
-    return normalizeDestinationResults(response.data, input.limit);
-  }
-  async createTrip(input, context) {
-    this.requireWrite("createTrip");
-    const items = input.days.flatMap((day) => day.items.map((item) => ({ date: day.date, item })));
-    if (items.length > 0)
-      this.requireItemAdds();
-    if (items.some(({ item }) => item.note)) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary item notes is not covered by the observed provider contract.");
-    }
-    const itemOperations = items.map(({ date: date6, item }) => ({
-      op: "add_item",
-      date: date6,
-      item
-    }));
-    const totalSteps = 1 + itemOperations.reduce((sum, operation) => sum + plannedAddWrites(operation), 0);
-    const coverResponse = await this.api.request({
-      method: "GET",
-      path: "/TravelSchedule/GetSystemCoverList"
-    });
-    const firstCover = asRecord(asArray(coverResponse.data)[0]);
-    const coverMediaId = pickString(firstCover, "id", "Id");
-    if (!coverMediaId) {
-      throw new AppError("PROVIDER_INDETERMINATE", "Could not resolve the system cover required for trip creation.");
-    }
-    const labelsResponse = await this.api.request({
-      method: "GET",
-      path: "/TravelScheduleUserLabel/Get"
-    });
-    const defaultLabels = asArray(labelsResponse.data).map(asRecord).filter((candidate) => candidate.isSystem === true && pickString(candidate, "name") === "未標籤");
-    const defaultLabelId = defaultLabels.length === 1 ? pickString(defaultLabels[0] ?? {}, "id") : undefined;
-    if (!defaultLabelId) {
-      throw new AppError("PROVIDER_INDETERMINATE", "Could not resolve the unique system 未標籤 label required for trip creation.");
-    }
-    const createResponse = await this.api.request({
-      method: "POST",
-      path: "/TravelSchedule/AddV2",
-      expectedAccountRefHash: context.expectedAccountRefHash,
-      language: "zh-tw",
-      bodyEncoding: "form",
-      body: {
-        CoverMediaId: coverMediaId,
-        Name: input.title,
-        StartDate: providerDate(input.startDate),
-        EndDate: providerDate(input.endDate),
-        TotalDay: totalDays(input.startDate, input.endDate),
-        ViewMode: "DetailMode",
-        TravelScheduleUserLabelId: defaultLabelId,
-        id: "",
-        TrafficType: input.trafficType,
-        IsForceUpdateTsdRoute: 0,
-        updateTime: 0,
-        LocationKey: input.destinations.map((destination) => destination.providerLocationKey)
-      }
-    });
-    const created = asRecord(createResponse.data);
-    const tripId = pickString(created, "id", "Id");
-    if (!tripId) {
-      throw new AppError("PROVIDER_INDETERMINATE", "chicTrip did not return the created trip ID.");
-    }
-    let updateTime;
-    try {
-      updateTime = requireVersionFrom(created, "AddV2");
-    } catch (error51) {
-      throw new AppError("PROVIDER_INDETERMINATE", "chicTrip accepted trip creation but did not return a usable revision.", {
-        cause: error51,
-        details: providerProgressDetails(tripId, 1, totalSteps)
-      });
-    }
-    let completedSteps = 1;
-    if (itemOperations.length > 0) {
-      let current;
-      try {
-        current = await this.readBackAtVersion(tripId, updateTime, completedSteps, totalSteps);
-      } catch (error51) {
-        if (error51 instanceof AppError && error51.code === "PROVIDER_INDETERMINATE") {
-          throw new AppError("PROVIDER_PARTIAL", "The trip shell was created, but its item plan could not be continued safely.", {
-            cause: error51,
-            details: providerProgressDetails(tripId, completedSteps, totalSteps)
-          });
-        }
-        throw error51;
-      }
-      for (const operation of itemOperations) {
-        let outcome;
-        try {
-          outcome = await this.addItem(tripId, operation, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-        } catch (error51) {
-          if (error51 instanceof AppError && (error51.code === "PROVIDER_PARTIAL" || error51.code === "PROVIDER_INDETERMINATE") && typeof error51.details === "object" && error51.details !== null) {
-            throw error51;
-          }
-          throw new AppError("PROVIDER_PARTIAL", "The trip shell was created, but only part of its item plan was applied.", {
-            cause: error51,
-            details: providerProgressDetails(tripId, completedSteps, totalSteps)
-          });
-        }
-        updateTime = outcome.providerVersion;
-        completedSteps = outcome.completedSteps;
-        current = outcome.trip;
-      }
-    }
-    return {
-      tripId,
-      providerVersion: updateTime,
-      completedSteps,
-      totalSteps
-    };
-  }
-  async updateTrip(tripId, operations, context) {
-    this.requireWrite("updateTrip");
-    let current = await this.getTrip(tripId);
-    if (context.expectedRevision && (current.revision.contentHash !== context.expectedRevision.contentHash || context.expectedRevision.providerVersion && current.revision.providerVersion !== context.expectedRevision.providerVersion)) {
-      throw new AppError("CONFLICT", "The itinerary changed before the first provider write.");
-    }
-    if (!current.revision.providerVersion) {
-      throw new AppError("PROVIDER_INDETERMINATE", "The itinerary has no provider revision, so no write can be attempted safely.");
-    }
-    let updateTime = current.revision.providerVersion;
-    let completedSteps = 0;
-    const totalSteps = plannedWritesForOperations(current, operations);
-    try {
-      for (const operation of operations) {
-        let operationReadBackHandled = false;
-        switch (operation.op) {
-          case "set_trip_fields":
-            updateTime = await this.updateTripFields(tripId, operation.fields, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-            break;
-          case "add_item": {
-            this.requireItemAdds();
-            const outcome = await this.addItem(tripId, operation, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-            updateTime = outcome.providerVersion;
-            completedSteps = outcome.completedSteps;
-            current = outcome.trip;
-            operationReadBackHandled = true;
-            break;
-          }
-          case "update_item":
-            updateTime = await this.updateItem(tripId, operation.itemId, operation.fields, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-            break;
-          case "remove_item":
-            updateTime = await this.removeItem(tripId, operation.itemId, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-            break;
-          case "move_item":
-            updateTime = await this.moveItem(tripId, operation.itemId, operation.toDate, operation.afterItemId, current, updateTime, context.expectedAccountRefHash, completedSteps, totalSteps);
-            break;
-        }
-        if (!operationReadBackHandled) {
-          completedSteps += 1;
-          current = await this.readBackAtVersion(tripId, updateTime, completedSteps, totalSteps);
-        }
-      }
-    } catch (error51) {
-      if (error51 instanceof AppError && (error51.code === "PROVIDER_PARTIAL" || error51.code === "PROVIDER_INDETERMINATE") && typeof error51.details === "object" && error51.details !== null) {
-        throw error51;
-      }
-      if (completedSteps > 0) {
-        throw new AppError("PROVIDER_PARTIAL", "Only part of the requested itinerary update was applied.", {
-          cause: error51,
-          details: { tripId, completedSteps, totalSteps }
-        });
-      }
-      throw error51;
-    }
-    return { tripId, providerVersion: updateTime, completedSteps, totalSteps };
-  }
-  requireWrite(capability) {
-    if (!this.config.enableUndocumentedWrites) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", `${capability} is disabled for undocumented chicTrip endpoints.`);
-    }
-  }
-  requireItemAdds() {
-    if (!this.config.enableExperimentalItemAdds) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary items requires CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=1.");
-    }
-  }
-  async readBackAtVersion(tripId, expectedVersion, completedSteps, totalSteps) {
-    let trip;
-    try {
-      trip = await this.getTrip(tripId);
-    } catch (error51) {
-      throw new AppError("PROVIDER_INDETERMINATE", "A provider write returned, but the itinerary could not be read back safely.", {
-        cause: error51,
-        details: providerProgressDetails(tripId, completedSteps, totalSteps)
-      });
-    }
-    if (!trip.revision.providerVersion || trip.revision.providerVersion !== expectedVersion) {
-      throw new AppError("PROVIDER_INDETERMINATE", "The provider revision changed or was unavailable during write reconciliation.", {
-        details: providerProgressDetails(tripId, completedSteps, totalSteps)
-      });
-    }
-    return trip;
-  }
-  async addItem(tripId, operation, current, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
-    this.requireItemAdds();
-    if (operation.item.note) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "Adding itinerary item notes is not covered by the observed provider contract.");
-    }
-    const dayIndex = current.days.findIndex((day2) => day2.date === operation.date);
-    const day = current.days[dayIndex];
-    if (dayIndex < 0 || !day) {
-      throw new AppError("VALIDATION_ERROR", `Cannot add an item outside the trip: ${operation.date}`);
-    }
-    if (day.items.some((item) => !item.id)) {
-      throw new AppError("PROVIDER_INDETERMINATE", "Cannot safely identify a newly added item because an existing provider item ID is missing.");
-    }
-    const beforeIds = new Set(day.items.map((item) => item.id));
-    let requiresSort = false;
-    if (operation.afterItemId) {
-      const anchorIndex = day.items.findIndex((item) => item.id === operation.afterItemId);
-      if (anchorIndex < 0) {
-        throw new AppError("NOT_FOUND", `The add-item anchor was not found on ${operation.date}: ${operation.afterItemId}`);
-      }
-      requiresSort = anchorIndex !== day.items.length - 1;
-    }
-    const providerDay = dayNumber(current.startDate, operation.date);
-    const placementResponse = await this.api.request({
-      method: "GET",
-      path: "/TravelScheduleDetail/GetAddWhere",
-      query: {
-        poiId: operation.item.place.providerPlaceId,
-        travelScheduleId: tripId,
-        travelScheduleUpdateTime: 0
-      }
-    });
-    const placementDays = asArray(asRecord(placementResponse.data).dayList).map(asRecord);
-    const placementDay = placementDays.find((candidate) => pickNumber(candidate, "day", "Day") === providerDay) ?? placementDays[dayIndex];
-    const candidates = asArray(placementDay?.addWhereList).map(asRecord);
-    const allowedEndTokens = day.items.length === 0 ? new Set(["end", "start", "first"]) : new Set(["end"]);
-    const endCandidate = candidates.find((candidate) => {
-      const token = pickString(candidate, "addWhereId", "AddWhereId");
-      return token ? allowedEndTokens.has(token) : false;
-    });
-    const addWhereId = endCandidate ? pickString(endCandidate, "addWhereId", "AddWhereId") : undefined;
-    if (!addWhereId) {
-      throw new AppError("PROVIDER_INDETERMINATE", "The provider did not return a verified end-of-day insertion choice.");
-    }
-    let completedSteps = completedBefore;
-    const addResponse = await requestMutation(this.api, {
-      method: "POST",
-      path: "/TravelScheduleDetail/Add",
-      expectedAccountRefHash,
-      bodyEncoding: "multipart",
-      body: {
-        TravelScheduleId: tripId,
-        Day: providerDay,
-        PoiId: operation.item.place.providerPlaceId,
-        AddWhereId: addWhereId,
-        TravelScheduleUpdateTime: updateTime,
-        ...operation.item.place.coverMediaId ? { TsdCoverMediaId: operation.item.place.coverMediaId } : {},
-        TsdName: operation.item.place.name
-      }
-    }, "TravelScheduleDetail/Add", tripId, completedSteps, totalSteps);
-    let nextVersion = requireAcceptedWriteVersion(addResponse.data, "TravelScheduleDetail/Add", tripId, completedSteps, totalSteps);
-    completedSteps += 1;
-    let readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
-    const readBackDay = readBack.days.find((candidate) => candidate.date === operation.date);
-    const addedItems = readBackDay?.items.filter((item) => item.id && !beforeIds.has(item.id)) ?? [];
-    if (addedItems.length !== 1 || addedItems[0]?.place.providerPlaceId !== operation.item.place.providerPlaceId) {
-      throw new AppError("PROVIDER_INDETERMINATE", "The item add returned, but a unique new provider item could not be reconciled.", {
-        details: providerProgressDetails(tripId, completedSteps, totalSteps)
-      });
-    }
-    const itemId = addedItems[0].id;
-    if (addItemNeedsFollowUpUpdate(operation)) {
-      try {
-        nextVersion = await this.updateItem(tripId, itemId, {
-          ...operation.item.startsAt ? { startsAt: operation.item.startsAt } : {},
-          ...operation.item.durationMinutes !== undefined ? { durationMinutes: operation.item.durationMinutes } : {},
-          ...operation.item.categoryId !== undefined ? { categoryId: operation.item.categoryId } : {}
-        }, nextVersion, expectedAccountRefHash, completedSteps, totalSteps);
-      } catch (error51) {
-        if (hasIndeterminateProgress(error51))
-          throw error51;
-        throw new AppError("PROVIDER_PARTIAL", "The item was added, but its requested fields were not fully applied.", {
-          cause: error51,
-          details: providerProgressDetails(tripId, completedSteps, totalSteps)
-        });
-      }
-      completedSteps += 1;
-      readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
-    }
-    if (requiresSort && operation.afterItemId) {
-      try {
-        nextVersion = await this.moveItem(tripId, itemId, operation.date, operation.afterItemId, readBack, nextVersion, expectedAccountRefHash, completedSteps, totalSteps);
-      } catch (error51) {
-        if (hasIndeterminateProgress(error51))
-          throw error51;
-        throw new AppError("PROVIDER_PARTIAL", "The item was added, but its requested order was not fully applied.", {
-          cause: error51,
-          details: providerProgressDetails(tripId, completedSteps, totalSteps)
-        });
-      }
-      completedSteps += 1;
-      readBack = await this.readBackAtVersion(tripId, nextVersion, completedSteps, totalSteps);
-    }
-    return {
-      providerVersion: nextVersion,
-      completedSteps,
-      trip: readBack
-    };
-  }
-  async rawTrip(tripId) {
-    const listResponse = await this.api.request({
-      method: "GET",
-      path: "/TravelSchedule/GetMyAndCollaboration",
-      query: { updateTime: 0, orderByColumn: "updatetime", sort: "desc" }
-    });
-    const summary = asArray(listResponse.data).map(normalizeTripSummary).find((candidate) => candidate.id === tripId);
-    if (!summary)
-      throw new AppError("NOT_FOUND", `Trip not found: ${tripId}`);
-    const response = await this.api.request({
-      method: "GET",
-      path: "/TravelScheduleDetail/Get",
-      query: {
-        travelScheduleId: tripId,
-        travelScheduleName: summary.title,
-        TravelScheduleUpdateTime: summary.providerVersion ?? 0,
-        isMyTravelSchedule: summary.permission === "owner" ? 1 : 0
-      }
-    });
-    return extractTripRoot(response.data, tripId);
-  }
-  async updateTripFields(tripId, fields, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
-    const root = await this.rawTrip(tripId);
-    const info = asRecord(root.travelScheduleInfo);
-    const startDate = fields.startDate ?? normalizeTrip(root, tripId).startDate;
-    const endDate = fields.endDate ?? normalizeTrip(root, tripId).endDate;
-    const destinations = fields.destinations ?? normalizeTrip(root, tripId).destinations;
-    const verify = await this.api.request({
-      method: "GET",
-      path: "/TravelScheduleDetail/VerifyUpdateTime",
-      query: {
-        TravelScheduleId: tripId,
-        travelScheduleUpdateTime: updateTime
-      }
-    });
-    const latestVersion = requireVersionFrom(verify.data, "VerifyUpdateTime");
-    const response = await requestMutation(this.api, {
-      method: "PUT",
-      path: "/TravelSchedule/UpdateV3",
-      expectedAccountRefHash,
-      language: "zh-tw",
-      bodyEncoding: "form",
-      body: {
-        CoverMediaId: pickString(info, "coverMediaId", "CoverMediaId") ?? "",
-        Name: fields.title ?? pickString(info, "name", "Name") ?? "Untitled trip",
-        StartDate: providerDate(startDate),
-        EndDate: providerDate(endDate),
-        TotalDay: totalDays(startDate, endDate),
-        ViewMode: pickString(info, "viewMode", "ViewMode") ?? "DetailMode",
-        TravelScheduleUserLabelId: pickString(info, "userLabelId", "TravelScheduleUserLabelId") ?? "",
-        id: tripId,
-        TrafficType: fields.trafficType ?? pickString(info, "trafficType", "TrafficType") ?? "Custom",
-        IsForceUpdateTsdRoute: 0,
-        updateTime: latestVersion,
-        LocationKey: destinations.map((destination) => destination.providerLocationKey)
-      }
-    }, "UpdateV3", tripId, completedBefore, totalSteps);
-    return requireAcceptedWriteVersion(response.data, "UpdateV3", tripId, completedBefore, totalSteps);
-  }
-  async updateItem(tripId, itemId, fields, updateTime, expectedAccountRefHash, completedBefore = 0, totalSteps = 1) {
-    if (fields.note !== undefined) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "Updating itinerary item notes is not yet mapped to a verified provider contract.");
-    }
-    const edit = await this.api.request({
-      method: "GET",
-      path: "/TravelScheduleDetail/GetEditInfo",
-      query: {
-        TsdId: itemId,
-        TravelScheduleId: tripId,
-        TravelScheduleUpdateTime: updateTime
-      }
-    });
-    const current = asRecord(edit.data);
-    const startsAt = fields.startsAt;
-    const timeValue = typeof startsAt === "string" ? providerWallClock(startsAt) : "";
-    const currentArrivalTime = providerWallClock(pickString(current, "customArrivalTime", "CustomArrivalTime"));
-    const currentDepartureTime = providerWallClock(pickString(current, "departureTime", "DepartureTime", "customDepartureTime", "CustomDepartureTime"));
-    const response = await requestMutation(this.api, {
-      method: "PUT",
-      path: "/TravelScheduleDetail/Update",
-      ...expectedAccountRefHash ? { expectedAccountRefHash } : {},
-      bodyEncoding: "multipart",
-      body: {
-        TsdId: itemId,
-        Name: fields.name ?? pickString(current, "name", "Name") ?? "Untitled place",
-        PoiClassificationId: fields.categoryId === null ? "" : fields.categoryId ?? pickString(current, "poiClassificationId", "PoiClassificationId") ?? "",
-        StayTime: fields.durationMinutes ?? pickNumber(current, "stayTime", "StayTime") ?? 0,
-        IsUseCustomArrivalTime: fields.startsAt === undefined ? providerFlag(current, "isUseCustomArrivalTime", "IsUseCustomArrivalTime") : startsAt ? 1 : 0,
-        CustomArrivalTime: fields.startsAt === undefined ? currentArrivalTime : timeValue,
-        IsUseCustomDepartureTime: providerFlag(current, "isUseCustomDepartureTime", "IsUseCustomDepartureTime"),
-        CustomDepartureTime: currentDepartureTime,
-        TravelScheduleId: tripId,
-        travelScheduleUpdateTime: updateTime
-      }
-    }, "TravelScheduleDetail/Update", tripId, completedBefore, totalSteps);
-    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Update", tripId, completedBefore, totalSteps);
-  }
-  async removeItem(tripId, itemId, trip, updateTime, expectedAccountRefHash, completedBefore, totalSteps) {
-    const dayIndex = trip.days.findIndex((day) => day.items.some((item) => item.id === itemId));
-    if (dayIndex < 0)
-      throw new AppError("NOT_FOUND", `Trip item not found: ${itemId}`);
-    const response = await requestMutation(this.api, {
-      method: "DELETE",
-      path: "/TravelScheduleDetail/Delete",
-      expectedAccountRefHash,
-      bodyEncoding: "multipart",
-      body: {
-        TravelScheduleId: tripId,
-        Day: dayIndex + 1,
-        TsdId: itemId,
-        TravelScheduleUpdateTime: updateTime
-      }
-    }, "TravelScheduleDetail/Delete", tripId, completedBefore, totalSteps);
-    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Delete", tripId, completedBefore, totalSteps);
-  }
-  async moveItem(tripId, itemId, toDate, afterItemId, trip, updateTime, expectedAccountRefHash, completedBefore = 0, totalSteps = 1) {
-    const sourceIndex = trip.days.findIndex((day) => day.items.some((item) => item.id === itemId));
-    const targetIndex = trip.days.findIndex((day) => day.date === toDate);
-    if (sourceIndex < 0)
-      throw new AppError("NOT_FOUND", `Trip item not found: ${itemId}`);
-    if (targetIndex < 0) {
-      throw new AppError("VALIDATION_ERROR", `Target date is outside the trip: ${toDate}`);
-    }
-    if (sourceIndex !== targetIndex) {
-      throw new AppError("UNSUPPORTED_CAPABILITY", "Moving itinerary items across days is not covered by the verified current provider contract.");
-    }
-    const targetItems = trip.days[targetIndex]?.items ?? [];
-    if (targetItems.some((item) => !item.id)) {
-      throw new AppError("PROVIDER_INDETERMINATE", "Cannot safely sort an itinerary day because at least one provider item ID is missing.");
-    }
-    const targetIds = targetItems.map((item) => item.id).filter((id) => id !== itemId);
-    const insertionIndex = afterItemId ? targetIds.indexOf(afterItemId) + 1 : targetIds.length;
-    if (afterItemId && insertionIndex === 0) {
-      throw new AppError("NOT_FOUND", `Target item not found: ${afterItemId}`);
-    }
-    targetIds.splice(insertionIndex, 0, itemId);
-    const response = await requestMutation(this.api, {
-      method: "PUT",
-      path: "/TravelScheduleDetail/Sort",
-      ...expectedAccountRefHash ? { expectedAccountRefHash } : {},
-      bodyEncoding: "multipart",
-      body: {
-        TravelScheduleId: tripId,
-        MoveOutDay: sourceIndex + 1,
-        MoveInDay: targetIndex + 1,
-        MoveTsdId: itemId,
-        TsdIdList: targetIds,
-        travelScheduleUpdateTime: updateTime
-      }
-    }, "TravelScheduleDetail/Sort", tripId, completedBefore, totalSteps);
-    return requireAcceptedWriteVersion(response.data, "TravelScheduleDetail/Sort", tripId, completedBefore, totalSteps);
-  }
-}
-
-// src/state/store.ts
-import { randomUUID } from "node:crypto";
-import {
-  chmod as chmod2,
-  mkdir as mkdir2,
-  open,
-  readFile,
-  rename,
-  stat,
-  unlink,
-  writeFile
-} from "node:fs/promises";
-import { join as join2 } from "node:path";
-var EMPTY_STATE = {
-  schemaVersion: 1,
-  previews: {},
-  usedApprovalNonces: {},
-  ledger: {}
-};
-function delay(milliseconds) {
-  return new Promise((resolve2) => setTimeout(resolve2, milliseconds));
-}
-
-class JsonStateStore {
-  stateDir;
-  statePath;
-  lockPath;
-  constructor(stateDir) {
-    this.stateDir = stateDir;
-    this.statePath = join2(stateDir, "state.json");
-    this.lockPath = join2(stateDir, "state.lock");
-  }
-  async ensure() {
-    await mkdir2(this.stateDir, { recursive: true, mode: 448 });
-    await chmod2(this.stateDir, 448);
-  }
-  async read() {
-    await this.ensure();
-    try {
-      const raw = await readFile(this.statePath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed.schemaVersion !== 1)
-        throw new Error("Unsupported state schema.");
-      return parsed;
-    } catch (error51) {
-      const code = error51.code;
-      if (code === "ENOENT")
-        return structuredClone(EMPTY_STATE);
-      throw error51;
-    }
-  }
-  async update(mutate) {
-    await this.ensure();
-    const release = await this.acquireLock();
-    try {
-      const state = await this.read();
-      const result = await mutate(state);
-      await this.write(state);
-      return result;
-    } finally {
-      await release();
-    }
-  }
-  async write(state) {
-    const temporaryPath = `${this.statePath}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}
-`, {
-      mode: 384
-    });
-    await chmod2(temporaryPath, 384);
-    await rename(temporaryPath, this.statePath);
-  }
-  async acquireLock() {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      try {
-        const handle = await open(this.lockPath, "wx", 384);
-        await handle.writeFile(`${process.pid}
-`);
-        return async () => {
-          await handle.close();
-          await unlink(this.lockPath).catch(() => {
-            return;
-          });
-        };
-      } catch (error51) {
-        if (error51.code !== "EEXIST")
-          throw error51;
-        try {
-          const lockStat = await stat(this.lockPath);
-          if (Date.now() - lockStat.mtimeMs > 30000) {
-            await unlink(this.lockPath);
-            continue;
-          }
-        } catch {
-          continue;
-        }
-        await delay(25);
-      }
-    }
-    throw new Error("Timed out waiting for the local state lock.");
-  }
-}
-
-// src/state/approval.ts
-import {
-  createHmac,
-  randomBytes,
-  randomUUID as randomUUID2,
-  timingSafeEqual
-} from "node:crypto";
-import { chmod as chmod3, readFile as readFile2, writeFile as writeFile2 } from "node:fs/promises";
-import { join as join3 } from "node:path";
-var ApprovalClaimsSchema = exports_external.object({
-  type: exports_external.literal("chictrip-change-approval"),
-  previewId: exports_external.uuid(),
-  intentHash: exports_external.string(),
-  executionPlanDigest: exports_external.string(),
-  accountRefHash: exports_external.string(),
-  transport: exports_external.enum(["browser", "official-api"]),
-  audience: exports_external.literal("chictrip-apply"),
-  issuedAt: exports_external.number().int(),
-  expiresAt: exports_external.number().int(),
-  nonce: exports_external.uuid()
-});
-function encode3(value) {
-  return Buffer.from(value).toString("base64url");
-}
-function decode3(value) {
-  return Buffer.from(value, "base64url");
-}
-
-class ApprovalService {
-  store;
-  approvalTtlMs;
-  secretPath;
-  constructor(store, approvalTtlMs) {
-    this.store = store;
-    this.approvalTtlMs = approvalTtlMs;
-    this.secretPath = join3(store.stateDir, "approval-secret");
-  }
-  async issue(preview, executionPlanDigest, typedConfirmation) {
-    if (Date.parse(preview.expiresAt) <= Date.now()) {
-      throw new AppError("PREVIEW_EXPIRED", "The preview has expired. Create a new preview.");
-    }
-    if (preview.blockers.length > 0) {
-      throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", {
-        details: preview.blockers
-      });
-    }
-    const expected = `APPLY ${preview.approval.reviewCode}`;
-    if (typedConfirmation.trim() !== expected) {
-      throw new AppError("APPROVAL_INVALID", `Confirmation did not match. Type exactly: ${expected}`);
-    }
-    const now = Date.now();
-    const claims = {
-      type: "chictrip-change-approval",
-      previewId: preview.previewId,
-      intentHash: preview.intentHash,
-      executionPlanDigest,
-      accountRefHash: preview.accountRefHash,
-      transport: preview.transport,
-      audience: "chictrip-apply",
-      issuedAt: now,
-      expiresAt: now + this.approvalTtlMs,
-      nonce: randomUUID2()
-    };
-    const payload = encode3(JSON.stringify(claims));
-    const signature = encode3(createHmac("sha256", await this.secret()).update(payload).digest());
-    return { token: `${payload}.${signature}`, claims };
-  }
-  async verify(token, expected) {
-    const [payload, suppliedSignature, extra] = token.split(".");
-    if (!payload || !suppliedSignature || extra) {
-      throw new AppError("APPROVAL_INVALID", "Malformed confirmation token.");
-    }
-    const expectedSignature = createHmac("sha256", await this.secret()).update(payload).digest();
-    const supplied = decode3(suppliedSignature);
-    if (supplied.length !== expectedSignature.length || !timingSafeEqual(supplied, expectedSignature)) {
-      throw new AppError("APPROVAL_INVALID", "Invalid confirmation token signature.");
-    }
-    let claims;
-    try {
-      claims = ApprovalClaimsSchema.parse(JSON.parse(decode3(payload).toString("utf8")));
-    } catch (error51) {
-      throw new AppError("APPROVAL_INVALID", "Invalid confirmation token claims.", {
-        cause: error51
-      });
-    }
-    if (claims.expiresAt <= Date.now()) {
-      throw new AppError("APPROVAL_EXPIRED", "The confirmation token has expired.");
-    }
-    if (claims.previewId !== expected.previewId || claims.intentHash !== expected.intentHash || claims.executionPlanDigest !== expected.executionPlanDigest || claims.accountRefHash !== expected.accountRefHash || claims.transport !== expected.transport) {
-      throw new AppError("APPROVAL_INVALID", "The confirmation token does not match this preview, account, or transport.");
-    }
-    return claims;
-  }
-  async secret() {
-    await this.store.ensure();
-    try {
-      return await readFile2(this.secretPath);
-    } catch (error51) {
-      if (error51.code !== "ENOENT")
-        throw error51;
-      const secret = randomBytes(32);
-      try {
-        await writeFile2(this.secretPath, secret, { flag: "wx", mode: 384 });
-        await chmod3(this.secretPath, 384);
-        return secret;
-      } catch (writeError) {
-        if (writeError.code !== "EEXIST")
-          throw writeError;
-        return readFile2(this.secretPath);
-      }
-    }
-  }
-}
-
-// src/service/trip-service.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
-function findItem(trip, itemId) {
-  for (const [dayIndex, day] of trip.days.entries()) {
-    const itemIndex = day.items.findIndex((item) => item.id === itemId);
-    if (itemIndex >= 0)
-      return { dayIndex, itemIndex };
-  }
-  return;
-}
-function rebuildDateRange(trip) {
-  const count = totalDays(trip.startDate, trip.endDate);
-  const old = new Map(trip.days.map((day) => [day.date, day]));
-  trip.days = Array.from({ length: count }, (_, index) => {
-    const date6 = dateAtOffset(trip.startDate, index);
-    return old.get(date6) ?? { date: date6, items: [] };
-  });
-}
-function explicitClearsMatch(actual, intent) {
-  if (intent.kind !== "update")
-    return true;
-  const finalCategoryChanges = new Map;
-  for (const operation of intent.operations) {
-    if (operation.op === "update_item" && operation.fields.categoryId !== undefined) {
-      finalCategoryChanges.set(operation.itemId, operation.fields.categoryId);
-    }
-  }
-  for (const [itemId, categoryId] of finalCategoryChanges) {
-    if (categoryId !== null)
-      continue;
-    const found = findItem(actual, itemId);
-    if (!found)
-      return false;
-    const item = actual.days[found.dayIndex]?.items[found.itemIndex];
-    if (!item || item.categoryId !== undefined)
-      return false;
-  }
-  return true;
-}
-function applyOperation(desired, operation, diff, blockers) {
-  switch (operation.op) {
-    case "set_trip_fields": {
-      const originalStartDate = desired.startDate;
-      const originalEndDate = desired.endDate;
-      const originalDays = structuredClone(desired.days);
-      for (const [field, after] of Object.entries(operation.fields)) {
-        const key = field;
-        const before = desired[key];
-        if (after !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
-          diff.push({
-            path: `/trip/${field}`,
-            action: "update",
-            before,
-            after
-          });
-          Object.assign(desired, { [field]: after });
-        }
-      }
-      const dateChangeRequested = operation.fields.startDate !== undefined || operation.fields.endDate !== undefined;
-      if (dateChangeRequested) {
-        const originalCount = totalDays(originalStartDate, originalEndDate);
-        const nextCount = totalDays(desired.startDate, desired.endDate);
-        if (nextCount < 1 || nextCount > 60) {
-          blockers.push({
-            code: "INVALID_DATE_RANGE",
-            message: "The requested date range must contain between 1 and 60 days."
-          });
-          desired.startDate = originalStartDate;
-          desired.endDate = originalEndDate;
-          desired.days = originalDays;
-        } else if (nextCount !== originalCount) {
-          blockers.push({
-            code: "DATE_RANGE_RESIZE_UNVERIFIED",
-            message: "Changing the number of itinerary days is not covered by a verified provider workflow."
-          });
-          rebuildDateRange(desired);
-        } else {
-          desired.days = originalDays.map((day, index) => ({
-            date: dateAtOffset(desired.startDate, index),
-            items: day.items
-          }));
-        }
-      } else {
-        rebuildDateRange(desired);
-      }
-      break;
-    }
-    case "add_item": {
-      const day = desired.days.find((candidate) => candidate.date === operation.date);
-      if (!day) {
-        blockers.push({
-          code: "DATE_OUTSIDE_TRIP",
-          message: `Cannot add an item outside the trip: ${operation.date}`
-        });
-        return;
-      }
-      let index = day.items.length;
-      if (operation.afterItemId) {
-        const afterIndex = day.items.findIndex((item2) => item2.id === operation.afterItemId);
-        if (afterIndex < 0) {
-          blockers.push({
-            code: "ITEM_NOT_FOUND",
-            message: `afterItemId was not found on ${operation.date}.`
-          });
-          return;
-        }
-        index = afterIndex + 1;
-      }
-      const item = structuredClone(operation.item);
-      day.items.splice(index, 0, item);
-      diff.push({
-        path: `/days/${operation.date}/items/${index}`,
-        action: "add",
-        after: operation.item
-      });
-      break;
-    }
-    case "update_item": {
-      const found = findItem(desired, operation.itemId);
-      if (!found) {
-        blockers.push({
-          code: "ITEM_NOT_FOUND",
-          message: `Trip item was not found: ${operation.itemId}`
-        });
-        return;
-      }
-      const item = desired.days[found.dayIndex]?.items[found.itemIndex];
-      if (!item)
-        return;
-      for (const [field, after] of Object.entries(operation.fields)) {
-        let before;
-        if (field === "name") {
-          before = item.place.name;
-          if (after !== undefined)
-            item.place.name = String(after);
-        } else {
-          const key = field;
-          before = item[key];
-          if (after === null) {
-            delete item[key];
-          } else if (after !== undefined) {
-            Object.assign(item, { [key]: after });
-          }
-        }
-        if (after !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
-          diff.push({
-            path: `/items/${operation.itemId}/${field}`,
-            action: "update",
-            before,
-            after
-          });
-        }
-      }
-      break;
-    }
-    case "remove_item": {
-      const found = findItem(desired, operation.itemId);
-      if (!found) {
-        blockers.push({
-          code: "ITEM_NOT_FOUND",
-          message: `Trip item was not found: ${operation.itemId}`
-        });
-        return;
-      }
-      const day = desired.days[found.dayIndex];
-      const [removed] = day?.items.splice(found.itemIndex, 1) ?? [];
-      diff.push({
-        path: `/items/${operation.itemId}`,
-        action: "remove",
-        before: removed
-      });
-      break;
-    }
-    case "move_item": {
-      const found = findItem(desired, operation.itemId);
-      const targetDay = desired.days.find((day) => day.date === operation.toDate);
-      if (!found || !targetDay) {
-        blockers.push({
-          code: "ITEM_NOT_FOUND",
-          message: `Could not resolve the move target for item ${operation.itemId}.`
-        });
-        return;
-      }
-      const sourceDay = desired.days[found.dayIndex];
-      if (sourceDay?.date !== targetDay.date) {
-        blockers.push({
-          code: "MOVE_ACROSS_DAYS_UNVERIFIED",
-          message: "Moving itinerary items across days is not covered by the verified current provider workflow."
-        });
-        return;
-      }
-      const [item] = sourceDay?.items.splice(found.itemIndex, 1) ?? [];
-      if (!item)
-        return;
-      let targetIndex = targetDay.items.length;
-      if (operation.afterItemId) {
-        const afterIndex = targetDay.items.findIndex((candidate) => candidate.id === operation.afterItemId);
-        if (afterIndex < 0) {
-          blockers.push({
-            code: "ITEM_NOT_FOUND",
-            message: `Move anchor was not found: ${operation.afterItemId}`
-          });
-          sourceDay?.items.splice(found.itemIndex, 0, item);
-          return;
-        }
-        targetIndex = afterIndex + 1;
-      }
-      targetDay.items.splice(targetIndex, 0, item);
-      diff.push({
-        path: `/items/${operation.itemId}`,
-        action: "move",
-        before: {
-          date: sourceDay?.date,
-          index: found.itemIndex
-        },
-        after: {
-          date: targetDay.date,
-          index: targetIndex
-        }
-      });
-      break;
-    }
-  }
-}
-function reviewCode(previewId) {
-  return sha256(previewId).slice(0, 8).toUpperCase();
-}
-function executionPlanDigest(stored) {
-  return sha256(stored);
-}
-function assertStoredPreviewIntegrity(stored, expectedPreviewId) {
-  if (stored.preview.previewId !== expectedPreviewId || sha256(stored.intent) !== stored.preview.intentHash) {
-    throw new AppError("APPROVAL_INVALID", "The stored preview no longer matches its approved intent. Create a new preview.");
-  }
-  const expectedBaseRevision = stored.intent.kind === "update" ? stored.intent.baseRevision : undefined;
-  if (sha256(expectedBaseRevision ?? null) !== sha256(stored.preview.baseRevision ?? null)) {
-    throw new AppError("APPROVAL_INVALID", "The stored preview revision binding is invalid. Create a new preview.");
-  }
-  if (!stored.desired || tripContentHash(stored.desired) !== stored.desiredContentHash) {
-    throw new AppError("APPROVAL_INVALID", "The stored desired itinerary failed its integrity check. Create a new preview.");
-  }
-  const computedDigest = executionPlanDigest({
-    preview: stored.preview,
-    intent: stored.intent,
-    desired: stored.desired,
-    desiredContentHash: stored.desiredContentHash
-  });
-  if (!stored.executionPlanDigest || computedDigest !== stored.executionPlanDigest) {
-    throw new AppError("APPROVAL_INVALID", "The stored execution plan failed its integrity check. Create a new preview.");
-  }
-}
-function assertLedgerBinding(entry, expected) {
-  if (entry.previewId !== expected.previewId || entry.intentHash !== expected.intentHash || entry.executionPlanDigest !== expected.executionPlanDigest || entry.accountRefHash !== expected.accountRefHash || entry.transport !== expected.transport) {
-    throw new AppError("IDEMPOTENCY_KEY_REUSED", "The idempotency key is bound to a different preview, account, transport, or execution plan.");
-  }
-}
-function ledgerResult(entry) {
-  if (entry.result) {
-    return {
-      ...entry.result,
-      status: entry.result.status === "applied" ? "already_applied" : entry.result.status
-    };
-  }
-  return {
-    operationId: entry.operationId,
-    status: "indeterminate",
-    reconciliation: {
-      state: "ambiguous",
-      message: "An earlier apply attempt is still in flight or ended before its result was recorded."
-    }
-  };
-}
-function safeReconciliationMessage(code) {
-  switch (code) {
-    case "CONFLICT":
-      return "The provider itinerary revision changed before the approved operation completed.";
-    case "PROVIDER_PARTIAL":
-      return "The provider may have applied only part of the approved operation. Reconcile by reading the itinerary.";
-    case "PROVIDER_ERROR":
-    case "PROVIDER_INDETERMINATE":
-      return "The provider write outcome could not be determined safely. Reconcile by reading the itinerary.";
-    default:
-      return "The approved operation failed without exposing provider diagnostics.";
-  }
-}
-
-class TripService {
-  transport;
-  store;
-  approval;
-  config;
-  constructor(transport, store, approval, config2) {
-    this.transport = transport;
-    this.store = store;
-    this.approval = approval;
-    this.config = config2;
-  }
-  capabilities() {
-    return this.transport.getCapabilities();
-  }
-  async listTrips(input) {
-    return this.transport.listTrips(ListTripsInputSchema.parse(input));
-  }
-  async getTrip(tripId) {
-    if (!tripId)
-      throw new AppError("VALIDATION_ERROR", "tripId is required.");
-    return this.transport.getTrip(tripId);
-  }
-  async searchPlaces(input) {
-    return this.transport.searchPlaces(SearchPlacesInputSchema.parse(input));
-  }
-  async searchDestinations(input) {
-    return this.transport.searchDestinations(SearchDestinationsInputSchema.parse(input));
-  }
-  async preview(input) {
-    const intent = TripChangeIntentSchema.parse(input);
-    const capabilities = await this.transport.getCapabilities();
-    if (!capabilities.authenticated || !capabilities.accountRefHash) {
-      throw new AppError("AUTH_REQUIRED", "Complete local chicTrip login before previewing account changes.");
-    }
-    const diff = [];
-    const blockers = [];
-    const warnings = [
-      {
-        code: "UNDOCUMENTED_PROVIDER_API",
-        message: "This preview targets undocumented chicTrip web endpoints. Review it carefully."
-      }
-    ];
-    let desired;
-    let baseRevision;
-    if (intent.kind === "create") {
-      desired = structuredClone(intent.desired);
-      diff.push({ path: "/trip", action: "add", after: desired });
-      if (!capabilities.write.createTrip) {
-        blockers.push({
-          code: "CREATE_DISABLED",
-          message: "Creating trips is disabled for the current transport configuration."
-        });
-      }
-      const items = desired.days.flatMap((day) => day.items);
-      if (items.length > 0 && !capabilities.write.addItem) {
-        blockers.push({
-          code: "ADD_ITEM_DISABLED",
-          message: "The plan contains itinerary items, but experimental item adds are not enabled."
-        });
-      }
-      if (items.some((item) => item.note)) {
-        blockers.push({
-          code: "ITEM_NOTE_UNSUPPORTED",
-          message: "Item notes are not covered by a verified write contract."
-        });
-      }
-    } else {
-      const current = await this.transport.getTrip(intent.tripId);
-      baseRevision = current.revision;
-      if (current.revision.contentHash !== intent.baseRevision.contentHash || intent.baseRevision.providerVersion && current.revision.providerVersion !== intent.baseRevision.providerVersion) {
-        throw new AppError("CONFLICT", "The itinerary changed since it was read. Fetch it again and create a new preview.", {
-          details: {
-            expectedRevision: intent.baseRevision,
-            currentRevision: current.revision
-          }
-        });
-      }
-      desired = {
-        title: current.title,
-        startDate: current.startDate,
-        endDate: current.endDate,
-        timezone: current.timezone,
-        destinations: structuredClone(current.destinations),
-        trafficType: current.trafficType,
-        days: structuredClone(current.days)
-      };
-      if (current.permission === "viewer" || current.permission === "unknown") {
-        blockers.push({
-          code: "TRIP_NOT_EDITABLE",
-          message: "The current chicTrip permission does not allow this itinerary to be edited."
-        });
-      }
-      for (const operation of intent.operations) {
-        applyOperation(desired, operation, diff, blockers);
-        if (operation.op === "set_trip_fields" && !capabilities.write.updateTripFields) {
-          blockers.push({
-            code: "UPDATE_FIELDS_DISABLED",
-            message: "Trip field updates are disabled."
-          });
-        }
-        if (operation.op === "add_item" && !capabilities.write.addItem) {
-          blockers.push({
-            code: "ADD_ITEM_DISABLED",
-            message: "Adding itinerary items is disabled."
-          });
-        }
-        if (operation.op === "update_item" && !capabilities.write.updateItem) {
-          blockers.push({
-            code: "UPDATE_ITEM_DISABLED",
-            message: "Updating itinerary items is disabled."
-          });
-        }
-        if (operation.op === "update_item" && operation.fields.note !== undefined) {
-          blockers.push({
-            code: "ITEM_NOTE_UNSUPPORTED",
-            message: "Updating item notes is not covered by a verified contract."
-          });
-        }
-        if (operation.op === "move_item" && !capabilities.write.moveItem) {
-          blockers.push({
-            code: "MOVE_ITEM_DISABLED",
-            message: "Moving itinerary items is disabled."
-          });
-        }
-        if (operation.op === "remove_item" && !capabilities.write.removeItem) {
-          blockers.push({
-            code: "REMOVE_ITEM_DISABLED",
-            message: "Removing itinerary items is disabled."
-          });
-        }
-      }
-      if (current.ownership === "collaborating") {
-        warnings.push({
-          code: "COLLABORATIVE_TRIP",
-          message: "This is a collaborative trip. Apply will re-check its revision immediately before writing."
-        });
-      }
-    }
-    desired = TripDraftSchema.parse(desired);
-    const now = Date.now();
-    const previewId = randomUUID3();
-    const intentHash = sha256(intent);
-    const estimatedProviderWrites = intent.kind === "create" ? 1 + intent.desired.days.reduce((sum, day) => sum + day.items.reduce((itemSum, item) => itemSum + 1 + Number(item.durationMinutes !== undefined || item.startsAt !== undefined || item.categoryId !== undefined), 0), 0) : intent.operations.reduce((sum, operation) => {
-      if (operation.op !== "add_item")
-        return sum + 1;
-      return sum + 1 + Number(operation.item.durationMinutes !== undefined || operation.item.startsAt !== undefined || operation.item.categoryId !== undefined) + Number(operation.afterItemId !== undefined);
-    }, 0);
-    const preview = {
-      schemaVersion: "1",
-      previewId,
-      intentHash,
-      transport: this.transport.kind,
-      accountRefHash: capabilities.accountRefHash,
-      createdAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + this.config.previewTtlMs).toISOString(),
-      ...baseRevision ? { baseRevision } : {},
-      diff,
-      blockers,
-      warnings,
-      estimatedProviderWrites,
-      approval: {
-        required: true,
-        reviewCode: reviewCode(previewId),
-        cliCommand: `chictrip changes approve ${previewId}`
-      }
-    };
-    const storedPlan = {
-      preview,
-      intent,
-      desired,
-      desiredContentHash: tripContentHash(desired)
-    };
-    const stored = {
-      ...storedPlan,
-      executionPlanDigest: executionPlanDigest(storedPlan)
-    };
-    await this.store.update((state) => {
-      state.previews[previewId] = stored;
-      for (const [id, candidate] of Object.entries(state.previews)) {
-        if (Date.parse(candidate.preview.expiresAt) < Date.now() - 86400000) {
-          delete state.previews[id];
-        }
-      }
-    });
-    return preview;
-  }
-  async approve(previewId, typedConfirmation) {
-    const state = await this.store.read();
-    const stored = state.previews[previewId];
-    if (!stored)
-      throw new AppError("NOT_FOUND", `Preview not found: ${previewId}`);
-    assertStoredPreviewIntegrity(stored, previewId);
-    if (stored.applyClaim) {
-      throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt and cannot be approved again.");
-    }
-    const issued = await this.approval.issue(stored.preview, stored.executionPlanDigest, typedConfirmation);
-    const approvedAt = new Date(issued.claims.issuedAt).toISOString();
-    const expiresAt = new Date(issued.claims.expiresAt).toISOString();
-    await this.store.update((currentState) => {
-      const currentStored = currentState.previews[previewId];
-      if (!currentStored) {
-        throw new AppError("NOT_FOUND", `Preview not found: ${previewId}`);
-      }
-      assertStoredPreviewIntegrity(currentStored, previewId);
-      if (currentStored.executionPlanDigest !== stored.executionPlanDigest || currentStored.applyClaim) {
-        throw new AppError("APPROVAL_INVALID", "The preview changed or was claimed while approval was being recorded.");
-      }
-      currentStored.approvalGrant = {
-        token: issued.token,
-        issuedAt: approvedAt,
-        expiresAt
-      };
-    });
-    return {
-      previewId,
-      intentHash: stored.preview.intentHash,
-      approvedAt,
-      expiresAt
-    };
-  }
-  async apply(input) {
-    const request = ApplyTripChangeInputSchema.parse(input);
-    const state = await this.store.read();
-    const stored = state.previews[request.previewId];
-    if (!stored) {
-      throw new AppError("NOT_FOUND", `Preview not found: ${request.previewId}`);
-    }
-    assertStoredPreviewIntegrity(stored, request.previewId);
-    if (stored.preview.intentHash !== request.intentHash) {
-      throw new AppError("APPROVAL_INVALID", "intentHash does not match the preview.");
-    }
-    const capabilities = await this.transport.getCapabilities();
-    if (!capabilities.authenticated || !capabilities.accountRefHash) {
-      throw new AppError("AUTH_REQUIRED", "The chicTrip session is not authenticated.");
-    }
-    if (stored.preview.accountRefHash !== capabilities.accountRefHash || stored.preview.transport !== this.transport.kind) {
-      throw new AppError("APPROVAL_INVALID", "The preview is bound to a different chicTrip account or transport.");
-    }
-    const ledgerBinding = {
-      previewId: request.previewId,
-      intentHash: request.intentHash,
-      executionPlanDigest: stored.executionPlanDigest,
-      accountRefHash: capabilities.accountRefHash,
-      transport: this.transport.kind
-    };
-    const existing = state.ledger[request.idempotencyKey];
-    if (existing) {
-      assertLedgerBinding(existing, ledgerBinding);
-      return ledgerResult(existing);
-    }
-    if (stored.applyClaim) {
-      if (stored.applyClaim.idempotencyKey === request.idempotencyKey) {
-        return {
-          operationId: stored.applyClaim.operationId,
-          status: "indeterminate",
-          reconciliation: {
-            state: "ambiguous",
-            message: "This preview was already claimed, but its local ledger entry is unavailable. Do not retry it."
-          }
-        };
-      }
-      throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt. Reconcile that attempt instead of retrying with a new key.");
-    }
-    if (Date.parse(stored.preview.expiresAt) <= Date.now()) {
-      throw new AppError("PREVIEW_EXPIRED", "The preview expired. Create a new one.");
-    }
-    if (stored.preview.blockers.length > 0) {
-      throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", {
-        details: stored.preview.blockers
-      });
-    }
-    if (!stored.approvalGrant) {
-      throw new AppError("APPROVAL_REQUIRED", `Run the interactive local approval command first: chictrip changes approve ${request.previewId}`);
-    }
-    const approvalToken = stored.approvalGrant.token;
-    const claims = await this.approval.verify(approvalToken, {
-      ...ledgerBinding
-    });
-    if (stored.intent.kind === "update") {
-      const current = await this.transport.getTrip(stored.intent.tripId);
-      const base = stored.intent.baseRevision;
-      if (current.revision.contentHash !== base.contentHash || base.providerVersion && current.revision.providerVersion !== base.providerVersion) {
-        throw new AppError("CONFLICT", "The itinerary changed after preview. No write was attempted.");
-      }
-    }
-    const operationId = randomUUID3();
-    const timestamp = new Date().toISOString();
-    const claim = await this.store.update((currentState) => {
-      const currentStored = currentState.previews[request.previewId];
-      if (!currentStored) {
-        throw new AppError("NOT_FOUND", `Preview not found: ${request.previewId}`);
-      }
-      assertStoredPreviewIntegrity(currentStored, request.previewId);
-      if (currentStored.preview.intentHash !== request.intentHash || currentStored.executionPlanDigest !== stored.executionPlanDigest || currentStored.preview.accountRefHash !== capabilities.accountRefHash || currentStored.preview.transport !== this.transport.kind) {
-        throw new AppError("APPROVAL_INVALID", "The preview changed before the write attempt could be claimed.");
-      }
-      if (Date.parse(currentStored.preview.expiresAt) <= Date.now()) {
-        throw new AppError("PREVIEW_EXPIRED", "The preview expired. Create a new one.");
-      }
-      if (currentStored.preview.blockers.length > 0) {
-        throw new AppError("PREVIEW_BLOCKED", "The preview has unresolved blockers.", { details: currentStored.preview.blockers });
-      }
-      const collision = currentState.ledger[request.idempotencyKey];
-      if (collision) {
-        assertLedgerBinding(collision, ledgerBinding);
-        return { kind: "existing", entry: structuredClone(collision) };
-      }
-      if (currentStored.applyClaim) {
-        if (currentStored.applyClaim.idempotencyKey === request.idempotencyKey) {
-          return {
-            kind: "claimed-without-ledger",
-            operationId: currentStored.applyClaim.operationId
-          };
-        }
-        throw new AppError("IDEMPOTENCY_KEY_REUSED", "This preview already has a provider write attempt. Reconcile that attempt instead of retrying with a new key.");
-      }
-      if (currentState.usedApprovalNonces[claims.nonce]) {
-        throw new AppError("APPROVAL_INVALID", "The confirmation token was already used.");
-      }
-      if (currentStored.approvalGrant?.token !== approvalToken) {
-        throw new AppError("APPROVAL_INVALID", "The local approval grant changed before the write attempt was claimed.");
-      }
-      currentState.usedApprovalNonces[claims.nonce] = timestamp;
-      delete currentStored.approvalGrant;
-      currentStored.applyClaim = {
-        idempotencyKey: request.idempotencyKey,
-        operationId,
-        approvalNonce: claims.nonce,
-        claimedAt: timestamp
-      };
-      currentState.ledger[request.idempotencyKey] = {
-        idempotencyKey: request.idempotencyKey,
-        previewId: request.previewId,
-        intentHash: request.intentHash,
-        executionPlanDigest: currentStored.executionPlanDigest,
-        accountRefHash: capabilities.accountRefHash,
-        transport: this.transport.kind,
-        operationId,
-        status: "in_flight",
-        createdAt: timestamp,
-        updatedAt: timestamp
-      };
-      return { kind: "claimed", stored: structuredClone(currentStored) };
-    });
-    if (claim.kind === "existing")
-      return ledgerResult(claim.entry);
-    if (claim.kind === "claimed-without-ledger") {
-      return {
-        operationId: claim.operationId,
-        status: "indeterminate",
-        reconciliation: {
-          state: "ambiguous",
-          message: "This preview was already claimed, but its local ledger entry is unavailable. Do not retry it."
-        }
-      };
-    }
-    const claimedStored = claim.stored;
-    let result;
-    let providerMutationReturned = false;
-    try {
-      const mutation = claimedStored.intent.kind === "create" ? await this.transport.createTrip(claimedStored.intent.desired, {
-        requestId: operationId,
-        idempotencyKey: request.idempotencyKey,
-        expectedAccountRefHash: capabilities.accountRefHash
-      }) : await this.transport.updateTrip(claimedStored.intent.tripId, claimedStored.intent.operations, {
-        requestId: operationId,
-        idempotencyKey: request.idempotencyKey,
-        expectedAccountRefHash: capabilities.accountRefHash,
-        expectedRevision: claimedStored.intent.baseRevision
-      });
-      providerMutationReturned = true;
-      const actual = await this.transport.getTrip(mutation.tripId);
-      const verified = actual.revision.contentHash === claimedStored.desiredContentHash || tripMatchesDesired(actual, claimedStored.desired) && explicitClearsMatch(actual, claimedStored.intent);
-      result = {
-        operationId,
-        status: verified ? "applied" : "indeterminate",
-        tripId: mutation.tripId,
-        revision: actual.revision,
-        completedSteps: mutation.completedSteps,
-        totalSteps: mutation.totalSteps,
-        reconciliation: verified ? {
-          state: "verified",
-          message: "The itinerary was read back and matches the approved preview."
-        } : {
-          state: "ambiguous",
-          message: "The provider accepted the writes, but the read-back content differs from the preview."
-        }
-      };
-    } catch (error51) {
-      const appError = error51 instanceof AppError ? error51 : new AppError("PROVIDER_INDETERMINATE", "The provider write outcome could not be determined.", {
-        cause: error51
-      });
-      const details = typeof appError.details === "object" && appError.details !== null ? appError.details : {};
-      const status = providerMutationReturned ? "indeterminate" : appError.code === "CONFLICT" ? "conflict" : appError.code === "PROVIDER_PARTIAL" ? "partial" : appError.code === "PROVIDER_INDETERMINATE" || appError.code === "PROVIDER_ERROR" ? "indeterminate" : "failed";
-      result = {
-        operationId,
-        status,
-        ...typeof details.tripId === "string" ? { tripId: details.tripId } : {},
-        ...typeof details.completedSteps === "number" ? { completedSteps: details.completedSteps } : {},
-        ...typeof details.totalSteps === "number" ? { totalSteps: details.totalSteps } : {},
-        reconciliation: {
-          state: "ambiguous",
-          message: safeReconciliationMessage(providerMutationReturned ? "PROVIDER_INDETERMINATE" : appError.code)
-        }
-      };
-    }
-    await this.store.update((currentState) => {
-      const ledger = currentState.ledger[request.idempotencyKey];
-      if (!ledger)
-        return;
-      ledger.status = result.status === "applied" || result.status === "already_applied" ? "applied" : result.status === "partial" ? "partial" : result.status === "indeterminate" ? "indeterminate" : "failed";
-      ledger.result = result;
-      ledger.updatedAt = new Date().toISOString();
-    });
-    return result;
-  }
-}
-
-// src/app.ts
-function createAppContext(options = {}) {
-  const config2 = options.config ?? loadConfig();
-  const session = new BrowserSession(config2);
-  const transport = options.transport ?? new BrowserChicTripTransport(session, config2);
-  const store = new JsonStateStore(config2.stateDir);
-  const approval = new ApprovalService(store, config2.approvalTtlMs);
-  const service = new TripService(transport, store, approval, config2);
-  return { config: config2, session, transport, store, approval, service };
-}
-
 // src/mcp/server.ts
 function serverInstructions(approvalMode) {
   return [
@@ -32087,8 +32087,9 @@ function createChicTripMcpServer(context = createAppContext(), options = {}) {
   return server;
 }
 
-// src/mcp/stdio.ts
-var server = createChicTripMcpServer();
+// src/mcp/chat-writable-stdio.ts
+var context = createAppContext();
+var server = createChicTripMcpServer(context, { approvalMode: "chat-form" });
 var transport = new StdioServerTransport;
 await server.connect(transport);
 async function shutdown() {
@@ -32102,4 +32103,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=714CA3C7548EBAA664756E2164756E21
+//# debugId=E7DDFE219856724564756E2164756E21

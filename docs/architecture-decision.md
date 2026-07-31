@@ -7,14 +7,19 @@
 
 採用一套共用的 typed core，外接：
 
-1. JSON CLI：提供可重現、自動化友善的底層介面，以及唯一的真人核准入口。
-2. stdio MCP：提供本機 ChatGPT／Codex 結構化 tools。
+1. JSON CLI：提供可重現、自動化友善的底層介面，以及本機模式的真人核准入口。
+2. stdio MCP：提供本機 MCP client／Codex 結構化 tools。
 3. Skill／Plugin：規範 agent 必須先讀取、產生 preview、展示 diff，再等待真人核准。
 
-HTTP MCP 只允許綁定 loopback，供 Secure MCP Tunnel 或受控內部 proxy
-轉接；不直接公開到網際網路。長期最佳方案是取得去趣官方 partner API、
-正式 OAuth／權限模型與書面自動化授權後，替換目前的 browser provider
+一般 ChatGPT 由 Secure MCP Tunnel 直接啟動 stdio MCP；HTTP MCP 則只允許綁定
+loopback，供受控本機 client 使用，不直接公開到網際網路。長期最佳方案是取得
+去趣官方 partner API、正式 OAuth／權限模型與書面自動化授權後，替換目前的 browser provider
 adapter，而保留 typed core、CLI 與 MCP tool contracts。
+
+Tunnel 保留兩個互不混用的 launcher：read-only 固定旗標 `0/0`；Chat writable
+固定旗標 `1/1`，並使用獨立的 form-elicitation MCP bundle。Deployment owner 必須
+在 conversation 開始前明確選擇 writable profile。若兩個 runtime 共用同一 Chrome
+profile，只能輪流執行；MCP 內仍不提供 approval tool。
 
 ## 方案比較
 
@@ -35,6 +40,11 @@ write claim，避免 CLI、MCP 和 Skill 各自實作一套不同安全規則。
 是可觀測且容易測試的底層介面；stdio MCP 只做薄的 tool mapping；Skill／Plugin
 則負責告訴 agent 何時讀取、何時 preview，以及哪些能力必須停止。
 
+MCP SDK 只會正確發布 object-shaped 的 top-level tool schema，因此 preview tool
+使用 `{ intent: <create-or-update-union> }` envelope；CLI 的 JSON intent 維持 direct
+shape。這讓 ChatGPT 的 `tools/list` 能看見 create/update 兩個完整 branch，而不會把
+頂層 discriminated union 靜默輸出成空 object。
+
 這個分層也讓 provider 可以替換：目前是專用 Chrome profile 內執行的未公開
 web endpoint adapter；未來若取得官方 API，只需新增正式 transport，不必重寫
 ChatGPT tools 或使用流程。
@@ -45,15 +55,26 @@ ChatGPT tools 或使用流程。
 
 1. 重新讀取行程與 provider revision。
 2. 建立只讀 preview，固定完整 execution plan、diff、帳號與 transport。
-3. 使用者在互動式本機 CLI 執行 `changes approve`，輸入精確的
-   `APPLY <reviewCode>`。MCP 沒有 approval tool，agent 不能批准自己的操作。
+3. 依 entrypoint 取得真人核准，但 MCP 一律沒有 approval tool：
+   - 預設 local 模式由使用者在互動式 CLI 執行 `changes approve`，輸入精確的
+     `APPLY <reviewCode>`。
+   - 私人 Chat writable 模式由 server 主動發出 MCP form elicitation，只有使用者
+     檢查 server-rendered 操作目標、完整 canonical diff 與 warnings，再提交完全相同
+     的精確字串才建立 grant；沒有 form capability、拒絕、取消或錯誤字串都 fail closed。
 4. apply 以同一個 preview、intent hash 與 idempotency key 原子取得一次
    write claim。每個 preview 最多只有一次 provider 寫入嘗試。
 5. 寫入前再檢查 revision，完成後回讀驗證。`conflict`、`partial` 或
    `indeterminate` 不得換新 idempotency key 盲目重試。
 
-approval grant 短效、一次性，保存在本機受限權限 state；secret 不經 argv、
-stdout 或 MCP 傳給模型。
+approval grant 短效、一次性，保存在本機受限權限 state；secret 不經 argv 或
+tool output 傳給模型。Chat form 的輸入只交給 server 的既有 approval validator。
+
+ChatGPT 原生 destructive-tool confirmation 沒有標準化、可由 server 驗證的簽章
+artifact；tool annotations 也不是 authorization。因此 writable bundle 只允許專用、
+私人、單一使用者的 ChatGPT Tunnel。通用 client 可以偽裝 elicitation capability，
+所以不能把此 bundle 用於 Responses API、Codex、公共 endpoint 或多人服務。若未來
+需要更強的 server-verifiable 真人身分，應採用帶登入、CSRF 與一次性 challenge 的
+URL elicitation，而不是自動核准。
 
 帳號綁定在 browser page 內原子擷取 `memberId`、access token 與 refresh
 token，並要求 access token 的 JWT `sub` 等於 `memberId`；digest 等待期間
@@ -68,8 +89,8 @@ tuple 若改變即停止。refresh 後的新 token 也必須維持相同 subject
   必須另開景點新增旗標。`p2` 只有假成功畫面，不作為 provider 契約。
 - `move_item` 只允許同一天內排序；跨日移動沒有已驗證的安全契約，會在送出
   provider 寫入前阻擋。
-- 修改 metadata、既有景點、刪除景點與同日排序仍須經完整 preview、真人
-  CLI approval、revision check、一次 write claim 與回讀驗證。
+- 修改 metadata、既有景點、刪除景點與同日排序仍須經完整 preview、對應模式的
+  真人 approval、revision check、一次 write claim 與回讀驗證。
 - browser automation 僅保存登入情境與執行 allowlist request；不將密碼、
   Cookie、access token 或 refresh token 輸出給 CLI、MCP 或模型。
 

@@ -5,7 +5,7 @@ import { createAppContext } from "../app.js";
 import { createChicTripMcpServer } from "./server.js";
 
 const context = createAppContext();
-const server = createChicTripMcpServer(context, { approvalMode: "host-ui" });
+const server = createChicTripMcpServer(context, { approvalMode: "chat-form" });
 const transport = new StdioServerTransport();
 
 await server.connect(transport);

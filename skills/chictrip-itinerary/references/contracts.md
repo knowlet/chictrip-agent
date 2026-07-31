@@ -4,6 +4,20 @@ Use ISO dates (`YYYY-MM-DD`) and offset-aware ISO timestamps. A trip can span at
 most 60 days and must contain exactly one `days` entry for every date in its
 range.
 
+The MCP preview tool wraps either normalized intent below in an `intent` field:
+
+```json
+{
+  "intent": {
+    "kind": "create",
+    "desired": {}
+  }
+}
+```
+
+The JSON file passed to `chictrip changes preview --input` is still the direct
+intent beginning with `kind`; do not add the MCP envelope to CLI input files.
+
 ## Create
 
 Resolve `providerLocationKey` with the MCP destination search tool. Do not
@@ -129,9 +143,11 @@ within the same date; cross-day moves are always blocked.
 
 ## Apply
 
-The local CLI records a short-lived approval grant only after the person types
-the exact review code in an interactive terminal. The secret remains in
-protected local state and is never returned to the agent.
+The default local flow records a short-lived approval grant only after the
+person types the exact review code in an interactive terminal. The dedicated
+private Chat writable flow instead asks for the same exact review code through
+server-initiated MCP form elicitation. The secret remains in protected local
+state and is never returned to the agent as tool output.
 
 ```json
 {
@@ -141,6 +157,6 @@ protected local state and is never returned to the agent.
 }
 ```
 
-The local grant is bound to the full execution plan, account, and transport.
-It expires quickly and is atomically consumed when that preview claims its
-single provider write attempt.
+The grant is bound to the full execution plan, account, and transport. It
+expires quickly and is atomically consumed when that preview claims its single
+provider write attempt.

@@ -18,27 +18,34 @@ const expectedTools = [
   "chictrip_apply_trip_change",
   "chictrip_get_change_status",
 ];
+const expectedEnabledWrites = [
+  "createTrip",
+  "updateTripFields",
+  "addItem",
+  "updateItem",
+  "moveItem",
+  "removeItem",
+];
 const temporaryStateDir = await mkdtemp(
-  resolve(tmpdir(), "chictrip-chat-tunnel-smoke-"),
+  resolve(tmpdir(), "chictrip-chat-writable-smoke-"),
 );
 
 const transport = new StdioClientTransport({
-  command: resolve(projectRoot, "scripts/run-chat-tunnel-mcp.sh"),
+  command: resolve(projectRoot, "scripts/run-chat-tunnel-mcp-writable.sh"),
   cwd: projectRoot,
   env: {
     ...getDefaultEnvironment(),
-    // Deliberately try to enable writes. The launcher must override both flags.
-    CHICTRIP_ENABLE_UNDOCUMENTED_WRITES: "1",
-    CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS: "1",
-    // The retired mode switch must not change the read-only launcher.
-    CHICTRIP_CHAT_HOST_APPROVAL: "1",
+    // Deliberately try to disable writes. The explicit launcher must keep its
+    // reviewed capability set stable.
+    CHICTRIP_ENABLE_UNDOCUMENTED_WRITES: "0",
+    CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS: "0",
     CHICTRIP_STATE_DIR: temporaryStateDir,
   },
   stderr: "inherit",
 });
 const client = new Client(
-  { name: "chictrip-chat-tunnel-smoke", version: "0.1.0" },
-  { capabilities: {} },
+  { name: "chictrip-chat-writable-smoke", version: "0.1.0" },
+  { capabilities: { elicitation: { form: {} } } },
 );
 
 try {
@@ -48,6 +55,9 @@ try {
   const toolNames = toolResponse.tools.map((tool) => tool.name);
   if (JSON.stringify(toolNames) !== JSON.stringify(expectedTools)) {
     throw new Error(`Unexpected MCP tools: ${toolNames.join(", ")}`);
+  }
+  if (toolNames.some((name) => name.includes("approve"))) {
+    throw new Error("Writable MCP must not expose a self-approval tool.");
   }
 
   const previewTool = toolResponse.tools.find(
@@ -64,7 +74,22 @@ try {
     previewSchema?.properties?.intent?.oneOf?.length !== 2
   ) {
     throw new Error(
-      "Chat tunnel preview tool did not publish create/update intent schemas.",
+      "Writable preview tool did not publish create/update intent schemas.",
+    );
+  }
+
+  const applyTool = toolResponse.tools.find(
+    (tool) => tool.name === "chictrip_apply_trip_change",
+  );
+  if (
+    applyTool?.title !== "Confirm and apply a chicTrip change" ||
+    !applyTool.description?.includes("form elicitation") ||
+    applyTool.annotations?.readOnlyHint !== false ||
+    applyTool.annotations.destructiveHint !== true ||
+    applyTool.annotations.idempotentHint !== true
+  ) {
+    throw new Error(
+      "Writable apply tool is missing its Chat confirmation contract.",
     );
   }
 
@@ -86,9 +111,15 @@ try {
     .filter(([key, value]) => key !== "requiresApproval" && value === true)
     .map(([key]) => key);
 
-  if (structured?.ok !== true || !writes || enabledWrites.length > 0) {
+  if (
+    structured?.ok !== true ||
+    !writes ||
+    JSON.stringify(enabledWrites) !== JSON.stringify(expectedEnabledWrites) ||
+    writes.deleteTrip !== false ||
+    writes.requiresApproval !== true
+  ) {
     throw new Error(
-      `Chat tunnel launcher capabilities failed or are not read-only (isError=${response.isError === true}, enabled=${enabledWrites.join(", ")}, result=${JSON.stringify(structured)}).`,
+      `Writable Chat tunnel capabilities are incorrect (isError=${response.isError === true}, enabled=${enabledWrites.join(", ")}, result=${JSON.stringify(structured)}).`,
     );
   }
 
@@ -97,7 +128,9 @@ try {
       ok: true,
       toolCount: toolNames.length,
       authenticated: structured.data?.authenticated === true,
-      writesEnabled: false,
+      writesEnabled: true,
+      enabledWrites,
+      requiresChatConfirmation: true,
     })}\n`,
   );
 } finally {

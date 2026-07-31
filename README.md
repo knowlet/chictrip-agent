@@ -2,7 +2,8 @@
 
 `chictrip-agent` 是一個 local-first 的去趣 chicTrip 行程整合，提供 JSON CLI、
 MCP server、Codex Skill／Plugin，以及供一般 ChatGPT 使用的 Secure MCP Tunnel
-入口。它可以讀取與整理行程，也能在使用者於本機逐次批准後，建立或修改行程。
+入口。它可以讀取與整理行程，也能在使用者透過本機 CLI 或私人 Chat 內的
+server-requested form 逐次批准後，建立或修改行程。
 
 > [!WARNING]
 > 這不是去趣官方 SDK。現行 provider adapter 使用去趣網頁前端在
@@ -14,7 +15,8 @@ MCP server、Codex Skill／Plugin，以及供一般 ChatGPT 使用的 Secure MCP
 - 讀取自己擁有或共同編輯的行程，以及每天的完整景點。
 - 搜尋去趣目的地與景點識別碼。
 - 預覽建立或修改行程的完整 diff，不在 preview 階段修改去趣。
-- 只有本機真人完成 `approve` 後，才允許一次 `apply` 寫入嘗試。
+- 每次寫入都必須先 preview；預設流程由本機真人批准，專用私人 Chat writable
+  流程則由 server 在 Chat 內要求精確 review code。
 - 寫入預設關閉；新增景點還需要第二個獨立的實驗性旗標。
 - 不支援跨日移動景點、刪除整趟行程、共編邀請、付款、訂房、保險或 eSIM。
 - MCP 刻意沒有 approval tool，因此 agent 不能批准自己的變更。
@@ -28,7 +30,8 @@ flowchart LR
   MCP --> CDX["Codex Plugin"]
   MCP --> TUN["Secure MCP Tunnel"]
   TUN --> CHAT["一般 ChatGPT"]
-  H["本機真人 approval"] --> C
+  H1["本機 CLI approval"] --> C
+  H2["Chat form elicitation"] --> C
 ```
 
 ## 支援矩陣
@@ -38,7 +41,7 @@ flowchart LR
 | JSON CLI | 可用 | 是 | 可明確啟用 | 開發、登入、人工批准、診斷 |
 | 本機 stdio MCP | 可用 | 是 | 可繼承 shell 旗標 | MCP 開發與測試 |
 | Codex personal Plugin | 可用 | 是 | 修改 personal deployment 後可用 | 日常 agent 工作流 |
-| 一般 ChatGPT + Secure MCP Tunnel | 已驗證 | 是 | 目前發行入口固定唯讀 | 私人 Chat 讀取與規劃 |
+| 一般 ChatGPT + Secure MCP Tunnel | 讀取已驗證；寫入 contract 已實作 | 是 | 需獨立 writable Tunnel 與 Chat form elicitation | 私人、單一使用者 Chat 讀取、規劃與受控同步 |
 | 公開 HTTPS MCP／Plugins Directory | 尚不可直接部署 | 否 | 否 | 需官方 API、OAuth 與架構改造 |
 
 ## 前置需求
@@ -60,24 +63,27 @@ bun install --frozen-lockfile
 bun run validate
 ```
 
-`bun run validate` 會依序執行 TypeScript typecheck、62 項測試、bundle build，
+`bun run validate` 會依序執行 TypeScript typecheck、完整測試、bundle build，
 再實際啟動建置後的 CLI。主要產物是：
 
 - `dist/cli.mjs`
 - `dist/http.mjs`
 - `mcp/server.mjs`
+- `mcp/chat-writable-server.mjs`
 
 `playwright-core` 不提交到 Git。Fresh clone 必須先執行 `bun install` 和 build／
 validate，建置腳本才會把 runtime 依賴放進產物旁的 `node_modules`。
 
-只驗證 Chat 專用 launcher 是否暴露八個工具且強制唯讀：
+分別驗證 Chat 唯讀與可寫 launcher。兩者都必須暴露八個工具、正確的
+create／update preview schema，而且不能暴露 approval tool：
 
 ```bash
 bun run smoke:chat-tunnel
+bun run smoke:chat-tunnel:writable
 ```
 
-這個 smoke 使用臨時 state；`authenticated:false` 是正常結果。它不代表已登入去趣，
-也不代表 OpenAI Tunnel 已連線。
+這兩個 smoke 使用臨時 state；`authenticated:false` 是正常結果。它們不代表已登入
+去趣，也不代表 OpenAI Tunnel 或 ChatGPT 的 form UI 已連線；smoke 不會寫入 provider。
 
 ## 兩種登入不可混用
 
@@ -171,11 +177,27 @@ ln -s "$PWD/dist/cli.mjs" "$HOME/.local/bin/chictrip"
 | `chictrip_search_places` | 搜尋景點 | 否 |
 | `chictrip_search_destinations` | 搜尋目的地 | 否 |
 | `chictrip_preview_trip_change` | 建立 diff 與 execution plan | 否 |
-| `chictrip_apply_trip_change` | 執行已預覽且本機批准的變更 | 是 |
+| `chictrip_apply_trip_change` | 執行已預覽且由對應模式真人批准的變更 | 是 |
 | `chictrip_get_change_status` | 讀取本機 idempotency ledger | 否 |
 
 工具清單會包含 apply，不代表寫入已開啟；永遠以 `chictrip_capabilities` 回傳的
 write capabilities 為準。
+
+MCP 呼叫 `chictrip_preview_trip_change` 時，要把完整 normalized intent 放在
+`intent` 欄位；CLI 的 intent JSON 則不包這一層：
+
+```json
+{
+  "intent": {
+    "kind": "create",
+    "desired": {
+      "title": "東京三日"
+    }
+  }
+}
+```
+
+上例只示意 MCP envelope；實際 `desired` 仍須包含日期、目的地與每天的完整欄位。
 
 ## 啟用寫入權限
 
@@ -245,13 +267,31 @@ codex plugin list --json
 ### 一般 ChatGPT
 
 [`scripts/run-chat-tunnel-mcp.sh`](scripts/run-chat-tunnel-mcp.sh) 會強制把兩個
-旗標都覆寫成 `0`。因此目前一般 Chat 發行入口是**確定唯讀**；在外層 export
-旗標也無法開啟寫入。
+旗標都覆寫成 `0`，並固定啟動 read-only-compatible bundle。外層 export 或舊的
+mode switch 都不能把這個 launcher 變成可寫；它也是快速回滾入口。
 
-若未來要在 Chat 測試寫入，必須新增另一個明確的 writable launcher、另一個
-runtime profile／alias，並先保持 item add 關閉。不要修改或重用唯讀 launcher。
-ChatGPT 方案與 workspace policy 也可能限制 write tools；以該 workspace 的實際
-能力為準。即使 Chat 能呼叫 apply，仍不能取得或代替本機人工 approval。
+[`scripts/run-chat-tunnel-mcp-writable.sh`](scripts/run-chat-tunnel-mcp-writable.sh)
+是 deployment owner 明確 opt-in 的專用可寫入口，固定啟用：
+
+```text
+CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=1
+CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=1
+```
+
+這個入口使用另一個 MCP bundle，apply 時由 server 發出 form elicitation，要求使用者
+先查看 server-rendered 的操作目標、完整 canonical diff、warnings、寫入數與期限，
+再輸入 preview 對應的精確 `APPLY <reviewCode>`。沒有 form capability、使用者
+拒絕／取消或代碼不符時一律 fail closed，不建立 grant，也不寫入去趣。
+
+必須為它建立獨立 Tunnel、runtime profile／alias 與清楚標示「可寫」的 ChatGPT App；
+不要修改或重用唯讀 launcher。它只適用私人、單一使用者的 ChatGPT Tunnel，不可供
+Responses API、Codex、通用 MCP client、公開 endpoint 或多人服務使用。通用 client
+可以偽裝 form capability，因此 Tunnel／workspace 隔離仍是必要的信任邊界。
+
+ChatGPT 可能另外顯示原生 destructive-write confirmation。那個 host 提示與 server
+form 是兩道不同控制；不要為了少一次提示而改錯 tool annotations。實際 write tool
+是否可用仍受 ChatGPT 方案、rollout 與 workspace policy 影響，以該 workspace 掃描後
+的能力為準。
 
 ## `preview → approve → apply`
 
@@ -261,16 +301,22 @@ Preview 不會修改去趣，但會將完整 execution plan 寫入本機 state�
 bun run cli -- changes preview --input <INTENT_JSON>
 ```
 
-檢查完整 diff、warnings、blockers、write count 與目標 `owned` 行程後，使用者必須
-在互動式本機終端執行：
+檢查完整 diff、warnings、blockers、write count 與目標 `owned` 行程後，依目前
+entrypoint 走其中一種真人核准。
+
+預設 CLI／本機 MCP 由使用者在互動式本機終端執行：
 
 ```bash
 bun run cli -- changes approve <PREVIEW_UUID>
 ```
 
-接著親自輸入畫面要求的精確字串 `APPLY <reviewCode>`。Approval grant 有效
-5 分鐘、一次性消耗，沒有 `--yes` 或 `--force`；approval secret 不會進入 argv、
-stdout 或 MCP。
+接著親自輸入畫面要求的精確字串 `APPLY <reviewCode>`。
+
+專用私人 Chat writable 不需回到本機 CLI。呼叫 apply 時，server 會在 Chat 內主動
+顯示 form，要求同一個精確字串；拒絕、取消或錯誤字串都不會建立 grant。
+
+Approval grant 有效 5 分鐘、一次性消耗，沒有 `--yes` 或 `--force`；approval secret
+不會進入 argv、stdout 或 MCP tool output。
 
 最後使用 preview 回傳的 `intentHash` 與新的 UUID 執行：
 
@@ -355,22 +401,26 @@ codex plugin list --json
 讓 ChatGPT 透過 outbound HTTPS 使用本機 stdio MCP，而不必把 server 暴露在公網。
 本機 Mac、Chrome 登入 profile 與 tunnel-client runtime 必須保持運行。
 
-### 1. 先驗證本機 read-only launcher
+### 1. 先驗證兩個本機 launcher
 
 ```bash
 bun run validate
 bun run cli -- auth status
 bun run smoke:chat-tunnel
+bun run smoke:chat-tunnel:writable
 ```
 
-不要把 `run-chat-tunnel-mcp.sh` 單獨當作 Tunnel 啟動命令；它只是
-`tunnel-client` 要管理的 stdio child process。
+第一個 smoke 必須回報 `writesEnabled:false`；第二個必須回報
+`writesEnabled:true`、六項 enabled writes 與 `requiresChatConfirmation:true`。
+兩者都只檢查本機 contract，不會寫入去趣。不要把任一 launcher 單獨當作 Tunnel
+啟動命令；它們是 `tunnel-client` 管理的 stdio child process。
 
-### 2. 建立 Tunnel 與 runtime key
+### 2. 建立獨立 Tunnel 與 runtime key
 
 1. 使用正確的 Apple／OpenAI 身分登入
    [Platform Tunnel settings](https://platform.openai.com/settings/organization/tunnels)。
-2. 建立 Tunnel，並關聯目標 ChatGPT workspace。
+2. 分別建立 `chicTrip Read Only` 與 `chicTrip Writable` Tunnel，兩者都關聯目標
+   ChatGPT workspace。不要讓同一個 App 名稱同時指向兩種權限。
 3. 建立只具 `Tunnels: Read + Use` 的 Runtime API key。
 4. 在 Platform 按 Copy 後，於本機執行以下腳本；不要把 key 貼進終端參數或對話：
 
@@ -388,38 +438,54 @@ bun run smoke:chat-tunnel
 
 ### 3. 啟動受管理的 runtime
 
-把 placeholder 換成自己的 Tunnel ID：
+唯讀 runtime：
 
 ```bash
 tunnel-client runtimes connect \
   --alias chictrip-chat \
   --profile chictrip-chat-readonly \
   --profile-dir "$PWD/.tunnel-client/profiles" \
-  --tunnel-id <YOUR_TUNNEL_ID> \
+  --tunnel-id <YOUR_READ_ONLY_TUNNEL_ID> \
   --runtime-api-key "file:$HOME/.local/share/chictrip-agent/openai-tunnel-runtime-key" \
   --mcp-command "$PWD/scripts/run-chat-tunnel-mcp.sh" \
   --json
 ```
 
-`.tunnel-client/` 是機器專屬設定，已被 Git 忽略。
+可寫 runtime：
+
+```bash
+tunnel-client runtimes connect \
+  --alias chictrip-chat-writable \
+  --profile chictrip-chat-writable \
+  --profile-dir "$PWD/.tunnel-client/profiles" \
+  --tunnel-id <YOUR_WRITABLE_TUNNEL_ID> \
+  --runtime-api-key "file:$HOME/.local/share/chictrip-agent/openai-tunnel-runtime-key" \
+  --mcp-command "$PWD/scripts/run-chat-tunnel-mcp-writable.sh" \
+  --json
+```
+
+`.tunnel-client/` 是機器專屬設定，已被 Git 忽略。若兩個 runtime 使用相同的
+`CHICTRIP_STATE_DIR`／Chrome profile，**不能同時執行**；先停止其中一個再啟動
+另一個。若需要同時在線，替 writable runtime 使用獨立 state/browser profile，並
+在該 profile 重新登入去趣。
 
 檢查 profile 與 runtime：
 
 ```bash
 tunnel-client doctor \
-  --profile chictrip-chat-readonly \
+  --profile chictrip-chat-writable \
   --profile-dir "$PWD/.tunnel-client/profiles" \
   --explain
 
-tunnel-client runtimes status chictrip-chat --json
+tunnel-client runtimes status chictrip-chat-writable --json
 ```
 
 只有 `process_running`、`healthy`、`ready` 都是 `true` 才算上線。
 
-停止 runtime：
+建立 App 與測試期間保持 runtime 運行。只有需要停用可寫入口或切回唯讀時才執行：
 
 ```bash
-tunnel-client runtimes stop chictrip-chat --json
+tunnel-client runtimes stop chictrip-chat-writable --json
 ```
 
 ### 4. 在 ChatGPT 建立 Developer mode App
@@ -427,21 +493,47 @@ tunnel-client runtimes stop chictrip-chat --json
 依官方 [Connect from ChatGPT](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#connect-from-chatgpt)：
 
 1. 在 ChatGPT **Settings → Security and login** 開啟 **Developer mode**。
-2. 前往 [ChatGPT Plugins](https://chatgpt.com/plugins)，按加號建立 App。
-3. Connection 選擇 **Tunnel**，選取可見的 Tunnel 或貼上 Tunnel ID。
-4. 若看不到 Tunnel，檢查 workspace association，以及建立者是否有
+2. 前往 [ChatGPT Plugins](https://chatgpt.com/plugins)，按加號建立 App。可寫版本
+   建議命名為「去趣行程助理（可寫）」。
+3. Connection 選擇 **Tunnel**，只選取 dedicated writable Tunnel。
+4. 工具掃描後確認共八個 tools；preview input 的 required 必須包含 `intent`，其下
+   有 create／update 兩個分支；apply 應標示為 write／destructive action。
+5. 若看不到 Tunnel，檢查 workspace association，以及建立者是否有
    `Tunnels: Read + Use`。
-5. 建立後更新 `.app.json` 的 App ID，再透過 `$plugin-creator` 重裝 Plugin。
-6. 開新 Chat，從工具選單連接 App。
+6. 若 App 曾掃描舊版空白 preview schema，請在 Manage／Actions 執行 Refresh；不能
+   假設已儲存的 tool snapshot 會自動更新。
+7. 建立後更新 `.app.json` 的 App ID，再透過 `$plugin-creator` 重裝 Plugin。
+8. 開新 Chat，從工具選單連接 App。
 
-建議 E2E smoke prompt：
+先做不寫入 smoke：
 
 ```text
 只使用「去趣行程助理」工具，不使用聊天記憶。
-先呼叫 chictrip_capabilities，確認所有 provider write capability 都是 false；
+先呼叫 chictrip_capabilities，確認 createTrip、updateTripFields、addItem、
+updateItem、moveItem、removeItem 都是 true，deleteTrip 是 false，
+requiresApproval 是 true；
 再呼叫 chictrip_list_trips，scope=all、limit=5，列出標題、日期、ownership 與 trip ID。
 不要呼叫 preview 或 apply。
 ```
+
+接著只建立 preview、不 apply：
+
+```text
+只使用「去趣行程助理」工具。先搜尋真實 destination 與 place ID，為一筆 disposable、
+owned 測試行程準備完整 create intent，呼叫 chictrip_preview_trip_change；顯示完整 diff、
+warnings、blockers、estimatedProviderWrites、expiresAt、previewId 與 intentHash，然後停止。
+不要呼叫 apply。
+```
+
+確認 preview 後再明確要求套用同一筆 preview。ChatGPT 呼叫 apply 時，server 必須顯示
+form，並在表單內重列操作目標、完整 canonical diff、warnings、estimated writes 與
+期限，讓使用者核對後親自輸入該 preview 的 `APPLY <reviewCode>`；拒絕或取消應回報
+`APPROVAL_REQUIRED` 且去趣不變。只有正式 canary 才接受 form，完成後必須再呼叫
+`chictrip_get_trip` 回讀驗證。由於 `deleteTrip:false`，測試行程需自行在去趣官方
+App／網站清理。
+
+完整的信任邊界與回滾方式見
+[`docs/chat-host-approval.md`](docs/chat-host-approval.md)。
 
 ## 正式遠端部署
 
@@ -449,7 +541,8 @@ tunnel-client runtimes stop chictrip-chat --json
 
 - `mcp:http` 強制只綁 loopback。
 - Provider authentication 依賴單一使用者本機 Chrome profile。
-- 人工 approval 依賴同一台機器的互動式 CLI。
+- 人工 approval 只支援同機互動式 CLI，或信任單一使用者私人 ChatGPT Tunnel 的
+  form elicitation；兩者都不是多人身分與授權模型。
 - 去趣 endpoints 未公開，沒有穩定版本契約或正式 OAuth scopes。
 
 正式版本至少需要：
@@ -460,7 +553,8 @@ tunnel-client runtimes stop chictrip-chat --json
 4. Server-side authorization、tenant isolation、rate limiting、secret management。
 5. Logs／metrics／tracing 不記錄 token 或敏感行程內容。
 6. 可回復部署、版本化 MCP metadata 與 backward-compatible tool schemas。
-7. 將 local approval 重新設計成伺服器端、agent 無法自行核准的確認流程。
+7. 使用者身分綁定、server-verifiable 且 agent 無法自行核准的確認流程，例如受保護的
+   URL elicitation；不能把 client 回傳的 form response 當成多人服務的身分證明。
 
 OpenAI 官方要求公開 submission 不得使用 temporary tunnel 或 local endpoint；詳見
 [Deploy the endpoint](https://developers.openai.com/plugins/build/mcp-server#deploy-the-endpoint)。
@@ -491,6 +585,8 @@ Secure MCP Tunnel 適合私人、本機或內網服務，不等同公開 product
 - 每次 provider request 都在同一個 browser page 內取得固定認證 tuple，並驗證
   JWT `sub` 與 `memberId` 一致；token 不離開 page context。
 - Approval 綁定完整 execution plan、帳號與 transport，短效且一次性消耗。
+- Chat writable 只有 server-requested form 的精確 review code 才能建立 approval；
+  無 capability、拒絕、取消或代碼不符都在 provider write 前停止。
 - Apply 前重讀 revision；不一致就停止，不能 force。
 - Provider 回應缺 revision、回讀不完整或結果不唯一時，回報
   `partial`／`indeterminate`，不宣稱成功。
@@ -523,6 +619,38 @@ personal canonical source、cachebuster、重裝、開新 task，再看 capabili
 確認 runtime `healthy`／`ready`、Tunnel 關聯正確 ChatGPT workspace，以及 App 建立者
 有 `Tunnels: Read + Use`。
 
+### ChatGPT 仍顯示舊的空白 preview schema
+
+Workspace 可能保存掃描當下的 tool snapshot。在 App 的 Manage／Actions 執行
+Refresh 與重新掃描；刷新後 `chictrip_preview_trip_change` 的 input 必須包含 required
+`intent`，其下有 create／update 兩個 branch。
+
+### ChatGPT 讀得到但不能使用 write tool
+
+確認目前使用 ChatGPT 支援自訂 App 的 surface、Developer mode 已啟用、App 掃描將
+preview／apply 標成 write actions，而且連接的是 dedicated writable Tunnel。若平台
+仍拒絕 write，代表該帳號／workspace 的方案、rollout 或 action policy 尚未允許；
+不要用 Responses API 或 generic client 繞過限制。
+
+### Writable capabilities 仍是 `false`
+
+以 `tunnel-client runtimes status` 確認 target 確實指向
+`run-chat-tunnel-mcp-writable.sh`，並確認舊的 read-only runtime 已停止。不要用外層
+`export` 猜測；launcher 會覆寫旗標，最後只相信 `chictrip_capabilities`。
+
+### Chat apply 回傳 `APPROVAL_REQUIRED`
+
+若訊息指出 client 不支援 server-side confirmation，表示目前 Chat surface 沒有宣告
+MCP form elicitation；若訊息指出 declined/cancelled，代表表單沒有被接受。兩種情況
+都不會寫入去趣。改用支援 form 的私人 Chat App，或回到預設 local CLI approval；
+不要新增自動核准 fallback。
+
+### Chrome profile 已被其他 process 使用
+
+不要讓 read-only 與 writable runtime 同時開啟同一 browser profile。停止其中一個；
+若確實需要兩者同時在線，替 writable runtime 使用另一個 state/browser profile 並
+重新登入去趣。
+
 ### `partial` 或 `indeterminate`
 
 不要重新產生 UUID 重試。先用 `changes status` 看本機 ledger，再用 `trips get`
@@ -536,6 +664,7 @@ bun test
 bun run build
 bun run validate
 bun run smoke:chat-tunnel
+bun run smoke:chat-tunnel:writable
 ```
 
 每次變更 tool schema、annotations、auth 或 App mapping 後，都應重新執行 Plugin
