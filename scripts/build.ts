@@ -25,6 +25,11 @@ const targets = [
     naming: "server.mjs",
   },
   {
+    entrypoint: resolve(projectRoot, "src/mcp/chat-writable-stdio.ts"),
+    outdir: pluginMcpDir,
+    naming: "chat-writable-server.mjs",
+  },
+  {
     entrypoint: resolve(projectRoot, "src/mcp/http.ts"),
     outdir: distDir,
     naming: "http.mjs",
@@ -64,7 +69,8 @@ await cp(
 );
 await chmod(resolve(distDir, "cli.mjs"), 0o755);
 await chmod(resolve(pluginMcpDir, "server.mjs"), 0o755);
+await chmod(resolve(pluginMcpDir, "chat-writable-server.mjs"), 0o755);
 
 process.stderr.write(
-  "Built self-contained dist/cli.mjs, dist/http.mjs, and mcp/server.mjs.\n",
+  "Built self-contained dist/cli.mjs, dist/http.mjs, mcp/server.mjs, and mcp/chat-writable-server.mjs.\n",
 );
