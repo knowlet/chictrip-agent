@@ -10,14 +10,24 @@ import {
 } from "../domain/schemas.js";
 import { AppError, type ErrorCode } from "../domain/errors.js";
 
-const SERVER_INSTRUCTIONS = [
-  "Use chictrip_list_trips and chictrip_get_trip before planning an update.",
-  "Resolve provider place and destination IDs with the search tools.",
-  "Call chictrip_preview_trip_change and show the exact diff, warnings, and blockers to the user.",
-  "Approval is deliberately unavailable through MCP: the user must run the preview's local CLI approval command.",
-  "After local approval, call chictrip_apply_trip_change with the matching preview ID, intent hash, and one UUID idempotency key. The approval secret remains in local 0600 state and is never exposed to the model.",
-  "After apply, inspect its verified reconciliation result or query chictrip_get_change_status.",
-].join(" ");
+export type McpApprovalMode = "local-cli" | "host-ui";
+
+export interface ChicTripMcpServerOptions {
+  approvalMode?: McpApprovalMode;
+}
+
+function serverInstructions(approvalMode: McpApprovalMode): string {
+  return [
+    "Use chictrip_list_trips and chictrip_get_trip before planning an update.",
+    "Resolve provider place and destination IDs with the search tools.",
+    "Call chictrip_preview_trip_change and show the exact diff, warnings, and blockers to the user.",
+    approvalMode === "host-ui"
+      ? "For a blocker-free preview, call chictrip_apply_trip_change. The Chat host must ask the user to approve that destructive tool call; that one host approval is the human approval, so no local CLI approval is needed."
+      : "Approval is unavailable through this MCP entrypoint: the user must run the preview's local CLI approval command.",
+    "Call chictrip_apply_trip_change with the matching preview ID, intent hash, and one UUID idempotency key. Reuse the same key only for the same attempt; never generate a new key after a write may have started.",
+    "After apply, inspect its verified reconciliation result or query chictrip_get_change_status.",
+  ].join(" ");
+}
 
 const StatusInputSchema = z
   .object({
@@ -260,16 +270,46 @@ async function getChangeStatus(
   };
 }
 
+async function ensureHostApproval(
+  context: AppContext,
+  input: z.infer<typeof ApplyTripChangeInputSchema>,
+): Promise<void> {
+  const state = await context.store.read();
+  if (state.ledger[input.idempotencyKey]) return;
+
+  const stored = state.previews[input.previewId];
+  if (!stored) {
+    throw new AppError("NOT_FOUND", `Preview not found: ${input.previewId}`);
+  }
+  if (stored.preview.intentHash !== input.intentHash) {
+    throw new AppError("APPROVAL_INVALID", "intentHash does not match the preview.");
+  }
+  if (stored.applyClaim) return;
+
+  const grantIsFresh =
+    stored.approvalGrant !== undefined &&
+    Date.parse(stored.approvalGrant.expiresAt) > Date.now();
+  if (grantIsFresh) return;
+
+  await context.service.approve(
+    input.previewId,
+    `APPLY ${stored.preview.approval.reviewCode}`,
+  );
+}
+
 export function createChicTripMcpServer(
   context: AppContext = createAppContext(),
+  options: ChicTripMcpServerOptions = {},
 ): McpServer {
+  const approvalMode = options.approvalMode ?? "local-cli";
+  const hostApproval = approvalMode === "host-ui";
   const server = new McpServer(
     {
       name: "chictrip-agent",
       version: "0.1.0",
     },
     {
-      instructions: SERVER_INSTRUCTIONS,
+      instructions: serverInstructions(approvalMode),
     },
   );
 
@@ -362,8 +402,9 @@ export function createChicTripMcpServer(
     "chictrip_preview_trip_change",
     {
       title: "Preview a chicTrip change",
-      description:
-        "Validate and preview a create or update intent without changing the provider itinerary. Show the returned diff, warnings, blockers, review code, and local approval command to the user.",
+      description: hostApproval
+        ? "Validate and preview a create or update intent without changing the provider itinerary. Show the exact diff, warnings, and blockers. A blocker-free preview can then be applied through one Chat-approved destructive tool call."
+        : "Validate and preview a create or update intent without changing the provider itinerary. Show the returned diff, warnings, blockers, review code, and local approval command to the user.",
       inputSchema: TripChangeIntentSchema,
       annotations: PREVIEW_ANNOTATIONS,
     },
@@ -373,7 +414,9 @@ export function createChicTripMcpServer(
         preview,
         preview.blockers.length > 0
           ? `Preview created with ${preview.blockers.length} blocker(s); no apply is allowed.`
-          : `Preview created with ${preview.diff.length} change(s). User approval must happen through the local CLI.`,
+          : hostApproval
+            ? `Preview created with ${preview.diff.length} change(s). Ask the user to approve the apply tool call in Chat; no local CLI approval is needed.`
+            : `Preview created with ${preview.diff.length} change(s). User approval must happen through the local CLI.`,
       );
     }),
   );
@@ -381,13 +424,17 @@ export function createChicTripMcpServer(
   server.registerTool(
     "chictrip_apply_trip_change",
     {
-      title: "Apply an approved chicTrip change",
-      description:
-        "Apply exactly one previously previewed and locally approved change. Requires the matching preview UUID, intent hash, and one UUID idempotency key. The human approval grant is loaded and consumed from protected local state; it is never passed through MCP. Reuse the same key only to inspect/recover the same attempt, and never generate a new key for an already attempted preview.",
+      title: hostApproval
+        ? "Approve and apply a chicTrip change"
+        : "Apply an approved chicTrip change",
+      description: hostApproval
+        ? "Apply exactly one previously previewed change. The Chat host must present this destructive tool call for user approval; that single approval authorizes this exact preview and the server immediately creates and consumes a short-lived grant bound to its intent, execution plan, account, and transport. Requires the matching preview UUID, intent hash, and one UUID idempotency key. Never generate a new key after a write may have started."
+        : "Apply exactly one previously previewed and locally approved change. Requires the matching preview UUID, intent hash, and one UUID idempotency key. The human approval grant is loaded and consumed from protected local state; it is never passed through MCP. Reuse the same key only to inspect/recover the same attempt, and never generate a new key for an already attempted preview.",
       inputSchema: ApplyTripChangeInputSchema,
       annotations: APPLY_ANNOTATIONS,
     },
     guarded(async (input) => {
+      if (hostApproval) await ensureHostApproval(context, input);
       const result = await context.service.apply(input);
       const summaries = {
         applied: "The approved chicTrip change was applied and verified by read-back.",
