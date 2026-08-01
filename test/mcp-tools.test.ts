@@ -118,6 +118,37 @@ describe("MCP tool contract", () => {
         idempotentHint: false,
         openWorldHint: true,
       });
+      const previewInput = preview?.inputSchema as
+        | {
+            required?: string[];
+            properties?: {
+              intent?: {
+                oneOf?: Array<{
+                  properties?: Record<string, unknown>;
+                  required?: string[];
+                }>;
+              };
+            };
+          }
+        | undefined;
+      expect(previewInput?.required).toEqual(["intent"]);
+      expect(previewInput?.properties?.intent?.oneOf).toHaveLength(2);
+      expect(
+        previewInput?.properties?.intent?.oneOf?.map((branch) =>
+          Object.keys(branch.properties ?? {}),
+        ),
+      ).toEqual([
+        ["kind", "desired"],
+        ["kind", "tripId", "baseRevision", "operations"],
+      ]);
+      expect(
+        previewInput?.properties?.intent?.oneOf?.map(
+          (branch) => branch.required,
+        ),
+      ).toEqual([
+        ["kind", "desired"],
+        ["kind", "tripId", "baseRevision", "operations"],
+      ]);
 
       const list = response.tools.find(
         (tool) => tool.name === "chictrip_list_trips",

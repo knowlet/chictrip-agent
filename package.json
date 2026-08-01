@@ -14,6 +14,7 @@
     "mcp:stdio": "bun run src/mcp/stdio.ts",
     "mcp:http": "bun run src/mcp/http.ts",
     "smoke:chat-tunnel": "bun run scripts/smoke-chat-tunnel.ts",
+    "smoke:chat-tunnel:writable": "bun run scripts/smoke-chat-tunnel-writable.ts",
     "test": "bun test",
     "validate": "bun run scripts/validate.ts"
   },

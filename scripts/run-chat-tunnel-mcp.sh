@@ -2,8 +2,8 @@
 
 set -eu
 
-# The first ChatGPT tunnel rollout is intentionally read-only. Do not inherit
-# either undocumented-write flag from the shell or a long-lived runtime.
+# This launcher is a stable read-only rollback boundary. Never inherit write
+# flags from a shell or long-lived runtime.
 export CHICTRIP_ENABLE_UNDOCUMENTED_WRITES=0
 export CHICTRIP_ENABLE_EXPERIMENTAL_ITEM_ADDS=0
 

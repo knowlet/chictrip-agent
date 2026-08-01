@@ -29,31 +29,46 @@ ask the user to paste a password, cookie, access token, or refresh token.
 
 1. Call `chictrip_capabilities`. Stop if the requested write capability is
    disabled.
-2. Call `chictrip_preview_trip_change`. This must not change the provider
-   itinerary.
+2. Call `chictrip_preview_trip_change` with the normalized create or update
+   request in its top-level `intent` field. This must not change the provider
+   itinerary. The CLI `changes preview --input` file remains the direct intent
+   without this MCP-only envelope.
 3. Show the user the complete diff, every warning, every blocker, the estimated
    provider write count, and the preview expiration.
 4. If blockers exist, resolve them by making a new intent and preview. Never
    apply a blocked preview.
-5. Ask the user to review the preview and run the returned local approval
-   command themselves. Approval is deliberately unavailable through MCP.
-6. Wait for the CLI to report that the short-lived approval grant was stored
-   locally. The approval secret must never be returned to or requested by the
-   model.
-7. Call `chictrip_apply_trip_change` once with the exact `previewId`,
-   `intentHash`, and one fresh UUID idempotency key. The server loads and
-   atomically consumes the local approval grant.
-8. Treat only `applied` or `already_applied` with verified reconciliation as
+5. Determine the active approval mode from the apply tool's title, description,
+   and preview summary:
+   - In **Chat form approval** mode, the apply tool says it will request MCP
+     form elicitation. Call `chictrip_apply_trip_change` only after presenting
+     the preview. The server form will repeat the target, canonical full diff,
+     warnings, estimated writes, and expiry before asking the user inside Chat
+     to type the exact `APPLY <reviewCode>` string. Do not send the user back to
+     a computer or ask them to run a CLI approval command. If the client cannot
+     show the form, or the user declines or cancels it, report
+     `APPROVAL_REQUIRED` and stop.
+   - In **local CLI approval** mode, ask the user to run the preview's local
+     approval command and wait until the CLI reports that the short-lived grant
+     was stored.
+6. Call `chictrip_apply_trip_change` once with the exact `previewId`,
+   `intentHash`, and one fresh UUID idempotency key. In Chat form approval mode,
+   the server creates and immediately consumes a short-lived grant bound to the
+   preview only after the form returns the exact review code. In local CLI mode,
+   it consumes the grant previously stored by the CLI. Approval secrets never
+   appear in tool output.
+7. Treat only `applied` or `already_applied` with verified reconciliation as
    complete. Report `conflict`, `partial`, `indeterminate`, or `failed` as
    incomplete, and do not retry blindly.
-9. Call `chictrip_get_trip` after a successful update when the user needs the
+8. Call `chictrip_get_trip` after a successful update when the user needs the
    final itinerary rendered. For uncertain outcomes, call
    `chictrip_get_change_status`; it never retries a write.
 
 ## Preserve safety boundaries
 
-- Never call apply based only on an earlier conversational confirmation. The
-  interactive CLI must have recorded the local approval grant.
+- Never treat ordinary conversational consent or destructive-tool metadata as
+  write approval. Approval must be either the exact review code collected by
+  server-initiated Chat form elicitation or a local CLI grant, according to the
+  active MCP entrypoint.
 - A preview gets at most one provider write attempt. Never generate a new
   idempotency key to retry a preview after `partial` or `indeterminate`.
 - Never reuse an idempotency key for a different intent.
@@ -66,7 +81,9 @@ ask the user to paste a password, cookie, access token, or refresh token.
 - Never attempt a cross-day `move_item`; it remains deliberately blocked.
 - Never silently alter a collaborative trip; identify it and mention that the
   revision will be rechecked.
-- Never enable undocumented write flags on the user's behalf.
+- During an itinerary operation, never change launchers or enable undocumented
+  write flags. A deployment owner must explicitly opt into the separate
+  writable runtime before the conversation starts.
 - Never use this integration for purchases, payments, eSIMs, insurance,
   transport bookings, account changes, publishing, or deleting an entire trip.
 - Explain that the adapter uses undocumented chicTrip web endpoints and can
