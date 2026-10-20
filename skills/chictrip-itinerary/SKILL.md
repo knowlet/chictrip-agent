@@ -1,13 +1,35 @@
 ---
 name: chictrip-itinerary
-description: Read, summarize, plan, preview, create, and modify the user's chicTrip itineraries through the local chictrip MCP server. Use when a user asks about their 去趣 or chicTrip trips, wants a new itinerary synchronized, or wants dates, destinations, places, timing, ordering, or trip metadata changed.
+description: Read, summarize, plan, preview, create, and modify the user's chicTrip itineraries through connected chictrip MCP tools in ChatGPT or Codex. Use when a user asks about their 去趣 or chicTrip trips, wants a new itinerary synchronized, or wants dates, destinations, places, timing, ordering, or trip metadata changed.
 ---
 
 # chicTrip Itinerary
 
-Use the local `chictrip` MCP server to work with the user's own chicTrip
-itineraries. Keep authentication in the dedicated local browser profile. Never
-ask the user to paste a password, cookie, access token, or refresh token.
+Use the chicTrip tools supplied by the active plugin, through either its local
+MCP server or its private ChatGPT App and Tunnel. Keep authentication in the
+dedicated browser profile on the computer running that server. Never ask the
+user to paste a password, cookie, access token, or refresh token.
+
+## Verify the connection
+
+1. Discover the active plugin's tools by their `chictrip_` names; the host may
+   prefix them with its own namespace. A skill being installed does not prove
+   that its App or Tunnel is connected.
+2. Call `chictrip_capabilities` before reading or changing itineraries. Use the
+   returned authentication and capability fields, not the App's display name
+   or an earlier conversation, to determine what is available now.
+3. If no chicTrip tools are available, explain that the App must be connected
+   before live data can be read. If the server is unavailable, identify the
+   connection failure; do not misreport it as an empty itinerary list. If
+   authentication is required, have the user sign in on the runtime computer
+   using the repository's existing login flow.
+4. In read-only mode, continue with reading, summarizing, and planning in chat.
+   State that a proposed plan has not been synchronized. Never enable writes,
+   switch App bindings, or replace the runtime to satisfy an itinerary request.
+5. Use the actual tool result as evidence. Successful MCP responses put their
+   payload in `structuredContent.data` with `ok: true`; an `isError` or
+   `ok: false` result is not a successful operation. Do not fabricate trips,
+   identifiers, synchronization results, or a logged-in account.
 
 ## Choose the workflow
 

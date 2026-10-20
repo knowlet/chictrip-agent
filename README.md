@@ -401,6 +401,23 @@ codex plugin list --json
 讓 ChatGPT 透過 outbound HTTPS 使用本機 stdio MCP，而不必把 server 暴露在公網。
 本機 Mac、Chrome 登入 profile 與 tunnel-client runtime 必須保持運行。
 
+### 為既有私人 App 補上行程 Skill
+
+建立 Developer App 之後，App 對應的私人 Plugin 可能只有 App binding，尚未包含
+這個 repository 的行程操作指引。可請 Plugin Creator 更新**既有 App 對應的
+Plugin**，加入完整的 `skills/chictrip-itinerary/`（包括 `references/contracts.md`
+與 `agents/openai.yaml`），並遞增 Plugin 版本。保留該 App 的 ID、連線、名稱、
+權限與私人可見性；唯讀版與可寫版各自保留原有 binding，不要另建重複 App。
+
+這個 Skill 同時適用本機 MCP 與 ChatGPT App；工具連線由外層 Plugin 的 `.mcp.json`
+或 `.app.json` 提供，所以 Skill 不另宣告一個僅供本機使用的 MCP dependency。
+更新 ChatGPT 的 App-backed Plugin 時，只加入 Skill 及其必要 manifest 變更，
+不要把本機 `.mcp.json`、Chrome profile、Tunnel key 或 `node_modules` 一起上傳。
+
+更新完成後仍須在目標對話連接 App，先呼叫 `chictrip_capabilities`，再列出行程。
+Skill 安裝成功、本機 smoke 通過與實際去趣帳號連線是三件不同的驗證；只有
+工具確實回傳已登入與真實行程資料，才能宣稱帳號已接通。
+
 ### 1. 先驗證兩個本機 launcher
 
 ```bash
