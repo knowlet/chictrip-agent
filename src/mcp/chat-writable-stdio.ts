@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createChicTripStdioTransport } from "./stdio-transport.js";
 import { createAppContext } from "../app.js";
 import { createChicTripMcpServer } from "./server.js";
 
 const context = createAppContext();
 const server = createChicTripMcpServer(context, { approvalMode: "chat-form" });
-const transport = new StdioServerTransport();
+const transport = createChicTripStdioTransport();
 
 await server.connect(transport);
 
