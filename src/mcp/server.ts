@@ -373,6 +373,8 @@ export function createChicTripMcpServer(
     },
     {
       instructions: serverInstructions(approvalMode),
+      // Count before schema validation; accommodates 60 days × 80 full items.
+      maxToolInputElements: 100_000,
     },
   );
 

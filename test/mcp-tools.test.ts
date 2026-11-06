@@ -81,6 +81,38 @@ async function context() {
 }
 
 describe("MCP tool contract", () => {
+  test("rejects oversized argument containers before invoking the provider", async () => {
+    const app = await context();
+    let calls = 0;
+    app.service.listTrips = async () => { calls += 1; return []; };
+    const server = createChicTripMcpServer(app);
+    const client = new Client({ name: "input-budget-test", version: "0.1.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const boundary = await client.callTool({
+        name: "chictrip_list_trips", arguments: { extra: Array(99_999).fill(0) },
+      });
+      expect(boundary.isError).not.toBe(true);
+      expect(calls).toBe(1);
+      for (const extra of [
+        Array(100_000).fill(0),
+        Object.fromEntries(Array.from({ length: 100_000 }, (_, i) => [String(i), 0])),
+      ]) {
+        const result = await client.callTool({ name: "chictrip_list_trips", arguments: { extra } });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toContain("maximum of 100000 elements");
+        expect(calls).toBe(1);
+      }
+      const recovered = await client.callTool({ name: "chictrip_list_trips", arguments: {} });
+      expect(recovered.isError).not.toBe(true);
+      expect(calls).toBe(2);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   test("exposes guarded itinerary tools without an approval tool", async () => {
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();

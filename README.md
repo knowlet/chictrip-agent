@@ -354,6 +354,20 @@ bun run mcp:stdio
 node mcp/server.mjs
 ```
 
+### MCP 輸入容量
+
+兩個 stdio 入口（唯讀相容與 Chat 可寫）共用 **64 MiB（67,108,864 bytes）**
+的輸入緩衝上限，包含 JSON 與換行。超限時會回報 transport error 並關閉連線，
+不截斷或自動重試。這是累積尚未解析資料的上限，不是 process 記憶體上限；
+JSON 解碼、驗證與複製可能同時使用更多記憶體。
+
+所有 MCP tool arguments 另限制 **100,000 個陣列元素與物件欄位**，在 schema
+驗證與 provider handler 前計算；超限會回傳工具錯誤，連線可繼續使用。
+已測試 60 天、每天 80 個景點、每筆 2,000 中文字備註的行程可經 stdio 解析。
+這不保證所有 schema 合法資料都低於上限：例如部分識別碼字串沒有長度限制，
+超過 64 MiB 的既有合法輸入現在會被拒絕。HTTP 仍維持獨立的 **1 MiB** body
+上限、loopback 限制、Origin 拒絕及 bearer 驗證。
+
 ### Loopback Streamable HTTP
 
 ```bash
