@@ -175,7 +175,17 @@ export function createMcpHttpServer(bearerToken: string): Server {
       return;
     }
 
-    const path = new URL(request.url ?? "/", "http://localhost").pathname;
+    let path: string;
+    try {
+      path = new URL(request.url ?? "/", "http://localhost").pathname;
+    } catch {
+      writeJson(response, 400, {
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "Invalid request target." },
+        id: null,
+      });
+      return;
+    }
     if (path !== "/mcp") {
       writeJson(response, 404, {
         jsonrpc: "2.0",
