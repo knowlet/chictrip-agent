@@ -1545,3 +1545,35 @@ describe("browser provider write contracts", () => {
     });
   });
 });
+
+describe("requested trip identity in detail arrays", () => {
+  const otherDetail = {
+    ...initialDetail,
+    travelScheduleInfo: { ...initialDetail.travelScheduleInfo, id: "other-trip" },
+  };
+
+  for (const [name, details] of [
+    ["different trip", [otherDetail]],
+    ["empty result", []],
+    ["missing identity", [{}]],
+  ] as const) {
+    test(`rejects ${name} rather than substituting the first record`, async () => {
+      const api = new StubApi([envelope([initialSummary]), envelope(details)]);
+      const transport = new BrowserChicTripTransport(session(), config(), api);
+      await expect(transport.getTrip("trip-1")).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
+      expect(api.requests).toHaveLength(2);
+      expect(api.requests.every((request) => request.method === "GET")).toBe(true);
+    });
+  }
+
+  test("selects the requested record after an unrelated record", async () => {
+    const api = new StubApi([
+      envelope([initialSummary]), envelope([otherDetail, initialDetail]),
+    ]);
+    const trip = await new BrowserChicTripTransport(session(), config(), api).getTrip("trip-1");
+    expect(trip.id).toBe("trip-1");
+    expect(trip.title).toBe(initialSummary.name);
+  });
+});

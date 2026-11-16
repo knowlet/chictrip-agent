@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeTrip } from "../src/provider/normalize.js";
+import { extractTripRoot, normalizeTrip } from "../src/provider/normalize.js";
 
 describe("provider normalization", () => {
   test("keeps only explicit custom arrival times", () => {
@@ -43,5 +43,18 @@ describe("provider normalization", () => {
 
     expect(trip.days[0]?.items[0]?.startsAt).toBe("2026-09-01T09:30:00+08:00");
     expect(trip.days[0]?.items[1]?.startsAt).toBeUndefined();
+  });
+});
+
+
+describe("detail root selection compatibility", () => {
+  test("keeps first-record behavior when no trip ID is supplied", () => {
+    const first = { travelScheduleInfo: { id: "first" } };
+    expect(extractTripRoot([first, { travelScheduleInfo: { id: "second" } }])).toBe(first);
+  });
+
+  test("keeps a direct object response unchanged", () => {
+    const root = { travelScheduleInfo: { id: "trip-1" } };
+    expect(extractTripRoot(root, "trip-1")).toBe(root);
   });
 });

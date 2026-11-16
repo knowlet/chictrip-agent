@@ -11,6 +11,7 @@ import {
   type TripSummary,
 } from "../domain/schemas.js";
 import { tripContentHash } from "../domain/canonical.js";
+import { AppError } from "../domain/errors.js";
 
 export type UnknownRecord = Record<string, unknown>;
 
@@ -86,6 +87,7 @@ export function extractTripRoot(data: unknown, tripId?: string): UnknownRecord {
       return pickString(info, "id", "Id") === tripId;
     });
     if (match) return match;
+    throw new AppError("NOT_FOUND", `Trip not found in provider response: ${tripId}`);
   }
   return records[0] ?? {};
 }
