@@ -91,6 +91,34 @@ describe("bounded stdio transport", () => {
     } finally { await h.close(); }
   }, 30_000);
 
+  test("accepts a valid message when the same chunk starts the next one", async () => {
+    const h = await harness();
+    try {
+      const first = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+      const nextStart = Buffer.alloc(STDIO_MAX_BUFFER_BYTES, 32);
+      const chunk = Buffer.concat([first, nextStart]);
+      expect(chunk.length).toBeGreaterThan(STDIO_MAX_BUFFER_BYTES);
+      h.input.write(chunk);
+      expect(h.errors).toEqual([]);
+      expect(h.isClosed()).toBe(false);
+      expect(h.messages).toEqual([{ jsonrpc: "2.0", id: 1, method: "ping" }]);
+    } finally { await h.close(); }
+  }, 30_000);
+
+  test("closes on one line longer than 64 MiB", async () => {
+    const h = await harness();
+    try {
+      const line = Buffer.alloc(STDIO_MAX_BUFFER_BYTES + 1, 32);
+      line[line.length - 1] = 10;
+      h.input.write(line);
+      expect(h.isClosed()).toBe(true);
+      expect(h.errors).toHaveLength(1);
+      expect(h.errors[0]?.message).toContain("exceeded maximum size of 67108864 bytes");
+      expect(h.messages).toHaveLength(0);
+      expect(h.input.listenerCount("data")).toBe(0);
+    } finally { await h.close(); }
+  }, 30_000);
+
   test("continues parsing consecutive small messages", async () => {
     const h = await harness();
     try {

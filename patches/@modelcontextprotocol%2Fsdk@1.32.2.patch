@@ -1,0 +1,70 @@
+diff --git a/dist/cjs/shared/stdio.js b/dist/cjs/shared/stdio.js
+index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..9846619b4fdbc3859e0c38ddb053aa97190b9666 100644
+--- a/dist/cjs/shared/stdio.js
++++ b/dist/cjs/shared/stdio.js
+@@ -13,12 +13,25 @@ class ReadBuffer {
+         this._maxBufferSize = options?.maxBufferSize ?? exports.STDIO_DEFAULT_MAX_BUFFER_SIZE;
+     }
+     append(chunk) {
+-        const newSize = (this._buffer?.length ?? 0) + chunk.length;
+-        if (newSize > this._maxBufferSize) {
+-            this.clear();
+-            throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++        const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
++        // Count each newline-delimited message (bytes since the previous
++        // newline, including that message's terminating newline), not the
++        // whole incoming chunk. A chunk may finish one in-limit message and
++        // begin the next.
++        let lineStart = 0;
++        while (lineStart < combined.length) {
++            const newlineIndex = combined.indexOf(10, lineStart);
++            const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
++            if (lineEnd - lineStart > this._maxBufferSize) {
++                this.clear();
++                throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++            }
++            if (newlineIndex === -1) {
++                break;
++            }
++            lineStart = lineEnd;
+         }
+-        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
++        this._buffer = combined;
+     }
+     readMessage() {
+         if (!this._buffer) {
+diff --git a/dist/esm/shared/stdio.js b/dist/esm/shared/stdio.js
+index cf20e652c2f8fb6444559e8dae7dc259b310acd6..d5da589b4d209fd8dab33ff01914a873dc6c7aab 100644
+--- a/dist/esm/shared/stdio.js
++++ b/dist/esm/shared/stdio.js
+@@ -8,12 +8,25 @@ export class ReadBuffer {
+         this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
+     }
+     append(chunk) {
+-        const newSize = (this._buffer?.length ?? 0) + chunk.length;
+-        if (newSize > this._maxBufferSize) {
+-            this.clear();
+-            throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++        const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
++        // Count each newline-delimited message (bytes since the previous
++        // newline, including that message's terminating newline), not the
++        // whole incoming chunk. A chunk may finish one in-limit message and
++        // begin the next.
++        let lineStart = 0;
++        while (lineStart < combined.length) {
++            const newlineIndex = combined.indexOf(10, lineStart);
++            const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
++            if (lineEnd - lineStart > this._maxBufferSize) {
++                this.clear();
++                throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++            }
++            if (newlineIndex === -1) {
++                break;
++            }
++            lineStart = lineEnd;
+         }
+-        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
++        this._buffer = combined;
+     }
+     readMessage() {
+         if (!this._buffer) {

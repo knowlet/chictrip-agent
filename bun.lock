@@ -16,6 +16,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "@modelcontextprotocol/sdk@1.32.2": "patches/@modelcontextprotocol%2Fsdk@1.32.2.patch",
+  },
   "packages": {
     "@hono/node-server": ["@hono/node-server@1.19.15", "", { "peerDependencies": { "hono": "^4" } }, "sha512-Za2ai6TLdKjUvnur+eenO6nuYYipVAEhyCAdaV8IRvmU9kK8crOZUSYvIXn72E4f8fJqyAbpcJuTsYYmZp9Deg=="],
 

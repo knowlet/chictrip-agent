@@ -21723,12 +21723,21 @@ class ReadBuffer {
     this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
   }
   append(chunk) {
-    const newSize = (this._buffer?.length ?? 0) + chunk.length;
-    if (newSize > this._maxBufferSize) {
-      this.clear();
-      throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+    const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
+    let lineStart = 0;
+    while (lineStart < combined.length) {
+      const newlineIndex = combined.indexOf(10, lineStart);
+      const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
+      if (lineEnd - lineStart > this._maxBufferSize) {
+        this.clear();
+        throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+      }
+      if (newlineIndex === -1) {
+        break;
+      }
+      lineStart = lineEnd;
     }
-    this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
+    this._buffer = combined;
   }
   readMessage() {
     if (!this._buffer) {
@@ -32189,4 +32198,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=08F288959A2AFD1B64756E2164756E21
+//# debugId=422251F6E24A05FF64756E2164756E21

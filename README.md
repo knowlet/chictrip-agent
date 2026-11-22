@@ -357,9 +357,10 @@ node mcp/server.mjs
 ### MCP 輸入容量
 
 兩個 stdio 入口（唯讀相容與 Chat 可寫）共用 **64 MiB（67,108,864 bytes）**
-的輸入緩衝上限，包含 JSON 與換行。超限時會回報 transport error 並關閉連線，
-不截斷或自動重試。這是累積尚未解析資料的上限，不是 process 記憶體上限；
-JSON 解碼、驗證與複製可能同時使用更多記憶體。
+的單則訊息上限。計算的是上一則換行之後的位元組，含該則結尾換行，而不是整個
+incoming chunk。同一 chunk 可以先結束一則未超限的完整訊息，再接下一個未超限的
+開頭。單行超過上限時會回報 transport error 並關閉連線，不截斷或自動重試。
+這不是 process 記憶體上限；JSON 解碼、驗證與複製可能同時使用更多記憶體。
 
 所有 MCP tool arguments 另限制 **100,000 個陣列元素與物件欄位**，在 schema
 驗證與 provider handler 前計算；超限會回傳工具錯誤，連線可繼續使用。
