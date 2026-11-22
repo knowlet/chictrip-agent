@@ -2,22 +2,29 @@
 
 Base: 61395b8712573e3face4c0f96c0b1f01c607fb47.
 
-extractTripRoot searches an array for the requested travelScheduleInfo ID, but
-previously fell back to the first record even when the requested ID was absent.
-Consequently getTrip(A) could return trip B's content. The existing getTrip check
-only rejected a falsy ID, not a different nonempty ID. Empty/idless arrays also
-fell through into normalization and surfaced unrelated schema errors.
+extractTripRoot searches an array for the requested trip ID. A matching record
+may carry that ID on `travelScheduleInfo.id` / `travelScheduleInfo.Id`, or, when
+the nested ID is absent, on the record's own `id` / `Id`. The previous
+implementation fell back to the first record even when the requested ID was
+absent, so getTrip(A) could return trip B's content. Matching only the nested
+ID then rejected a top-level `id` / `Id` with NOT_FOUND, which the base branch
+accepted. The existing getTrip check only rejected a falsy ID, not a different
+nonempty ID. Empty/idless arrays also fell through into normalization and
+surfaced unrelated schema errors.
 
-When an explicit trip ID is supplied and no array record matches, throw the
-existing NOT_FOUND AppError. Do not substitute another trip. Preserve the
-existing behavior for a matching record, direct object responses, and callers
-that do not supply an ID. Direct-object identity hardening is outside this patch.
+When an explicit trip ID is supplied and no array record matches either shape,
+throw the existing NOT_FOUND AppError. Do not substitute another trip. Preserve
+matching records for both ID shapes, direct object responses, and callers that
+do not supply an ID. Direct-object identity hardening is outside this patch.
 
 Three transport regressions (different trip, empty result, missing identity)
-failed on the unchanged base. A mixed-array matching control passed. After the
-fix all pass, along with no-ID and direct-object compatibility controls. Provider
-responses are synthetic and only GET operations are exercised; no live trip or
-account is accessed or mutated.
+failed on the unchanged base. A mixed-array matching control passed. Nested
+`travelScheduleInfo.id` / `Id` and top-level `id` / `Id` each select the
+requested record, including when an unrelated record precedes it. A top-level
+ID that is not the requested trip still throws NOT_FOUND. No-ID and
+direct-object compatibility controls still pass. Provider responses are
+synthetic and only GET operations are exercised; no live trip or account is
+accessed or mutated.
 
 The read-only validate workflow matches the one proposed in PR #5; it performs
 typecheck, offline tests, build and CLI/symlink smoke checks, without deployment.

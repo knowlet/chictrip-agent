@@ -78,14 +78,16 @@ export function totalDays(startDate: string, endDate: string): number {
   return dayNumber(startDate, endDate);
 }
 
+function detailRecordId(candidate: UnknownRecord): string | undefined {
+  const info = asRecord(candidate.travelScheduleInfo);
+  return pickString(info, "id", "Id") ?? pickString(candidate, "id", "Id");
+}
+
 export function extractTripRoot(data: unknown, tripId?: string): UnknownRecord {
   if (!Array.isArray(data)) return asRecord(data);
   const records = data.map(asRecord);
   if (tripId) {
-    const match = records.find((candidate) => {
-      const info = asRecord(candidate.travelScheduleInfo);
-      return pickString(info, "id", "Id") === tripId;
-    });
+    const match = records.find((candidate) => detailRecordId(candidate) === tripId);
     if (match) return match;
     throw new AppError("NOT_FOUND", `Trip not found in provider response: ${tripId}`);
   }

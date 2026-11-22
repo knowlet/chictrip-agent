@@ -1576,4 +1576,20 @@ describe("requested trip identity in detail arrays", () => {
     expect(trip.id).toBe("trip-1");
     expect(trip.title).toBe(initialSummary.name);
   });
+
+  for (const idField of ["id", "Id"] as const) {
+    test(`selects a detail record identified by a top-level ${idField}`, async () => {
+      const { travelScheduleInfo, ...rest } = initialDetail;
+      const { id: nestedId, ...info } = travelScheduleInfo;
+      expect(nestedId).toBe("trip-1");
+      const detail = { ...rest, ...info, [idField]: "trip-1" };
+      const api = new StubApi([
+        envelope([initialSummary]),
+        envelope([{ ...detail, [idField]: "other-trip" }, detail]),
+      ]);
+      const trip = await new BrowserChicTripTransport(session(), config(), api).getTrip("trip-1");
+      expect(trip.id).toBe("trip-1");
+      expect(trip.title).toBe(initialSummary.name);
+    });
+  }
 });
