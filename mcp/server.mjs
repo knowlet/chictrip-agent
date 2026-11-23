@@ -21893,6 +21893,7 @@ class StdioServerTransport {
     this._stdout = _stdout;
     this._started = false;
     this._closed = false;
+    this._accepted = new Set;
     this._ondata = (chunk) => {
       let overflow;
       try {
@@ -21902,17 +21903,12 @@ class StdioServerTransport {
       }
       if (overflow)
         this._stopReading();
-      const accepted = this.processReadBuffer();
+      for (const task of this.processReadBuffer())
+        this._track(task);
       if (!overflow)
         return;
       this.onerror?.(overflow);
-      const finish = () => {
-        this.close().catch(() => {});
-      };
-      if (accepted.length === 0)
-        finish();
-      else
-        Promise.allSettled(accepted).then(finish);
+      this._closeAfterAccepted();
     };
     this._onerror = (error51) => {
       this.onerror?.(error51);
@@ -21929,9 +21925,30 @@ class StdioServerTransport {
   }
   _stopReading() {
     this._stdin.off("data", this._ondata);
-    this._stdin.off("error", this._onerror);
     if (this._stdin.listenerCount("data") === 0)
       this._stdin.pause();
+  }
+  _track(task) {
+    this._accepted.add(task);
+    task.finally(() => {
+      this._accepted.delete(task);
+    });
+  }
+  _closeAfterAccepted() {
+    const finish = () => {
+      this.close().catch(() => {});
+    };
+    const pending = [...this._accepted];
+    if (pending.length === 0) {
+      finish();
+      return;
+    }
+    Promise.allSettled(pending).then(() => {
+      if (this._accepted.size === 0)
+        finish();
+      else
+        this._closeAfterAccepted();
+    });
   }
   processReadBuffer() {
     const accepted = [];
@@ -32345,4 +32362,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=1CCFD7CB35DDF9FA64756E2164756E21
+//# debugId=311177C389B97EEC64756E2164756E21

@@ -245,6 +245,86 @@ describe("bounded stdio transport", () => {
     expect(stored.reduce((sum, chunk) => sum + chunk.length, 0)).toBe(count);
   });
 
+  test("replies to a delayed tool call when a later write overflows", async () => {
+    const calls: string[] = [];
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const server = new McpServer({ name: "stub", version: "0.0.0" });
+    server.registerTool(
+      "stub_echo",
+      {
+        description: "Echo one string.",
+        inputSchema: { text: z.string() },
+      },
+      async ({ text }) => {
+        calls.push(text);
+        await gate;
+        return { content: [{ type: "text", text }] };
+      },
+    );
+    const transport = new StdioServerTransport(input, output, { maxBufferSize: 4_096 });
+    const transportErrors: Error[] = [];
+    transport.onerror = (error) => transportErrors.push(error);
+    const stdout: string[] = [];
+    output.on("data", (chunk) => stdout.push(chunk.toString("utf8")));
+    await server.connect(transport);
+    const write = (message: unknown) => {
+      input.write(`${JSON.stringify(message)}\n`);
+    };
+    const waitFor = (id: number) => new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`no reply for id ${id}`)), 2_000);
+      const onData = () => {
+        if (stdout.join("").includes(`"id":${id}`)) {
+          clearTimeout(timeout);
+          output.off("data", onData);
+          resolve();
+        }
+      };
+      output.on("data", onData);
+      onData();
+    });
+    try {
+      write({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "test", version: "0" },
+        },
+      });
+      await waitFor(1);
+      write({ jsonrpc: "2.0", method: "notifications/initialized" });
+      write({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "stub_echo", arguments: { text: "later" } },
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(calls).toEqual(["later"]);
+      const oversized = Buffer.alloc(4_097, 32);
+      oversized[oversized.length - 1] = 10;
+      input.write(oversized);
+      expect(input.listenerCount("data")).toBe(0);
+      expect(input.listenerCount("error")).toBeGreaterThan(0);
+      const stdinError = new Error("stdin broke");
+      expect(() => input.emit("error", stdinError)).not.toThrow();
+      expect(transportErrors).toContain(stdinError);
+      release();
+      await waitFor(2);
+      expect(stdout.join("")).toContain("later");
+    } finally {
+      release();
+      await server.close();
+    }
+  });
+
   test("replies to a tool call that shares a chunk with an oversized line", async () => {
     const calls: string[] = [];
     const input = new PassThrough();

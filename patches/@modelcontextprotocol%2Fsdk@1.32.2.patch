@@ -1,3 +1,6 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-1d969b9db2ad360d b/.bun-tag-1d969b9db2ad360d
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-4416cac1e31f1574 b/.bun-tag-4416cac1e31f1574
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
@@ -8,14 +11,15 @@ diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-f9906267995c0bcd b/
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/cjs/client/stdio.js b/dist/cjs/client/stdio.js
-index aabab78421a9b2e3981cf2ca138ea33494603a26..0a5107ccd168c99e8487c11dc41c0a50a6c437d9 100644
+index aabab78421a9b2e3981cf2ca138ea33494603a26..01d4640f3ffdb09a0b904ff37b8735d8bff5e82c 100644
 --- a/dist/cjs/client/stdio.js
 +++ b/dist/cjs/client/stdio.js
-@@ -94,16 +94,29 @@ class StdioClientTransport {
+@@ -94,16 +94,41 @@ class StdioClientTransport {
              this._process.stdin?.on('error', error => {
                  this.onerror?.(error);
              });
 -            this._process.stdout?.on('data', chunk => {
++            this._accepted = new Set();
 +            this._onstdout = (chunk) => {
 +                let overflow;
                  try {
@@ -30,23 +34,34 @@ index aabab78421a9b2e3981cf2ca138ea33494603a26..0a5107ccd168c99e8487c11dc41c0a50
 -            });
 +                if (overflow)
 +                    this._process?.stdout?.off('data', this._onstdout);
-+                const accepted = this.processReadBuffer();
++                for (const task of this.processReadBuffer()) {
++                    this._accepted.add(task);
++                    task.finally(() => {
++                        this._accepted.delete(task);
++                    });
++                }
 +                if (!overflow)
 +                    return;
 +                this.onerror?.(overflow);
 +                const finish = () => {
 +                    this.close().catch(() => { });
 +                };
-+                if (accepted.length === 0)
++                const pending = [...this._accepted];
++                if (pending.length === 0)
 +                    finish();
 +                else
-+                    Promise.allSettled(accepted).then(finish);
++                    Promise.allSettled(pending).then(() => {
++                        if (this._accepted.size === 0)
++                            finish();
++                        else
++                            Promise.allSettled([...this._accepted]).then(finish);
++                    });
 +            };
 +            this._process.stdout?.on('data', this._onstdout);
              this._process.stdout?.on('error', error => {
                  this.onerror?.(error);
              });
-@@ -134,18 +147,22 @@ class StdioClientTransport {
+@@ -134,18 +159,22 @@ class StdioClientTransport {
          return this._process?.pid ?? null;
      }
      processReadBuffer() {
@@ -71,14 +86,16 @@ index aabab78421a9b2e3981cf2ca138ea33494603a26..0a5107ccd168c99e8487c11dc41c0a50
      async close() {
          if (this._process) {
 diff --git a/dist/cjs/server/stdio.js b/dist/cjs/server/stdio.js
-index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..fad2909040317e62fae45ae4b079639300a5459c 100644
+index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..47726cdaee27d7a41ac04031ba24fba7e07a9b1f 100644
 --- a/dist/cjs/server/stdio.js
 +++ b/dist/cjs/server/stdio.js
-@@ -16,16 +16,31 @@ class StdioServerTransport {
+@@ -16,16 +16,27 @@ class StdioServerTransport {
          this._stdin = _stdin;
          this._stdout = _stdout;
          this._started = false;
 +        this._closed = false;
++        // Requests accepted on earlier chunks stay here until they settle.
++        this._accepted = new Set();
          // Arrow functions to bind `this` properly, while maintaining function identity.
          this._ondata = (chunk) => {
 +            let overflow;
@@ -91,33 +108,48 @@ index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..fad2909040317e62fae45ae4b0796393
 -                this.close().catch(() => { });
 +                overflow = error;
              }
-+            // An oversized line stops further reads. Requests already accepted in
-+            // this chunk still run and reply; close follows those replies.
++            // Stop further reads. Keep the stdin error listener until close().
 +            if (overflow)
 +                this._stopReading();
-+            const accepted = this.processReadBuffer();
++            for (const task of this.processReadBuffer())
++                this._track(task);
 +            if (!overflow)
 +                return;
 +            this.onerror?.(overflow);
-+            const finish = () => {
-+                this.close().catch(() => { });
-+            };
-+            if (accepted.length === 0)
-+                finish();
-+            else
-+                Promise.allSettled(accepted).then(finish);
++            this._closeAfterAccepted();
          };
          this._onerror = (error) => {
              this.onerror?.(error);
-@@ -43,21 +58,34 @@ class StdioServerTransport {
+@@ -43,21 +54,55 @@ class StdioServerTransport {
          this._stdin.on('data', this._ondata);
          this._stdin.on('error', this._onerror);
      }
 +    _stopReading() {
 +        this._stdin.off('data', this._ondata);
-+        this._stdin.off('error', this._onerror);
 +        if (this._stdin.listenerCount('data') === 0)
 +            this._stdin.pause();
++    }
++    _track(task) {
++        this._accepted.add(task);
++        task.finally(() => {
++            this._accepted.delete(task);
++        });
++    }
++    _closeAfterAccepted() {
++        const finish = () => {
++            this.close().catch(() => { });
++        };
++        const pending = [...this._accepted];
++        if (pending.length === 0) {
++            finish();
++            return;
++        }
++        Promise.allSettled(pending).then(() => {
++            if (this._accepted.size === 0)
++                finish();
++            else
++                this._closeAfterAccepted();
++        });
 +    }
      processReadBuffer() {
 +        const accepted = [];
@@ -361,14 +393,15 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..f87810dfaabb75fd3ddbe513ead185eb
  }
  exports.ReadBuffer = ReadBuffer;
 diff --git a/dist/esm/client/stdio.js b/dist/esm/client/stdio.js
-index 925ad2160eebfe8bc7390a889d850ba547c494fa..3f716989773c5ef4550514b49d0090e7211f1069 100644
+index 925ad2160eebfe8bc7390a889d850ba547c494fa..f0edfee1300493922c94da92235eb845a2993635 100644
 --- a/dist/esm/client/stdio.js
 +++ b/dist/esm/client/stdio.js
-@@ -87,16 +87,29 @@ export class StdioClientTransport {
+@@ -87,16 +87,41 @@ export class StdioClientTransport {
              this._process.stdin?.on('error', error => {
                  this.onerror?.(error);
              });
 -            this._process.stdout?.on('data', chunk => {
++            this._accepted = new Set();
 +            this._onstdout = (chunk) => {
 +                let overflow;
                  try {
@@ -383,23 +416,34 @@ index 925ad2160eebfe8bc7390a889d850ba547c494fa..3f716989773c5ef4550514b49d0090e7
 -            });
 +                if (overflow)
 +                    this._process?.stdout?.off('data', this._onstdout);
-+                const accepted = this.processReadBuffer();
++                for (const task of this.processReadBuffer()) {
++                    this._accepted.add(task);
++                    task.finally(() => {
++                        this._accepted.delete(task);
++                    });
++                }
 +                if (!overflow)
 +                    return;
 +                this.onerror?.(overflow);
 +                const finish = () => {
 +                    this.close().catch(() => { });
 +                };
-+                if (accepted.length === 0)
++                const pending = [...this._accepted];
++                if (pending.length === 0)
 +                    finish();
 +                else
-+                    Promise.allSettled(accepted).then(finish);
++                    Promise.allSettled(pending).then(() => {
++                        if (this._accepted.size === 0)
++                            finish();
++                        else
++                            Promise.allSettled([...this._accepted]).then(finish);
++                    });
 +            };
 +            this._process.stdout?.on('data', this._onstdout);
              this._process.stdout?.on('error', error => {
                  this.onerror?.(error);
              });
-@@ -127,18 +140,22 @@ export class StdioClientTransport {
+@@ -127,18 +152,22 @@ export class StdioClientTransport {
          return this._process?.pid ?? null;
      }
      processReadBuffer() {
@@ -424,14 +468,16 @@ index 925ad2160eebfe8bc7390a889d850ba547c494fa..3f716989773c5ef4550514b49d0090e7
      async close() {
          if (this._process) {
 diff --git a/dist/esm/server/stdio.js b/dist/esm/server/stdio.js
-index 76e877ede5f84d172e1ced16be24845112fc152c..1ae3340034717d02bffd645553117dbca1691e60 100644
+index 76e877ede5f84d172e1ced16be24845112fc152c..77af4762ec6e7872f24cdddd66df8dcb1d66b93f 100644
 --- a/dist/esm/server/stdio.js
 +++ b/dist/esm/server/stdio.js
-@@ -10,16 +10,31 @@ export class StdioServerTransport {
+@@ -10,16 +10,27 @@ export class StdioServerTransport {
          this._stdin = _stdin;
          this._stdout = _stdout;
          this._started = false;
 +        this._closed = false;
++        // Requests accepted on earlier chunks stay here until they settle.
++        this._accepted = new Set();
          // Arrow functions to bind `this` properly, while maintaining function identity.
          this._ondata = (chunk) => {
 +            let overflow;
@@ -444,33 +490,48 @@ index 76e877ede5f84d172e1ced16be24845112fc152c..1ae3340034717d02bffd645553117dbc
 -                this.close().catch(() => { });
 +                overflow = error;
              }
-+            // An oversized line stops further reads. Requests already accepted in
-+            // this chunk still run and reply; close follows those replies.
++            // Stop further reads. Keep the stdin error listener until close().
 +            if (overflow)
 +                this._stopReading();
-+            const accepted = this.processReadBuffer();
++            for (const task of this.processReadBuffer())
++                this._track(task);
 +            if (!overflow)
 +                return;
 +            this.onerror?.(overflow);
-+            const finish = () => {
-+                this.close().catch(() => { });
-+            };
-+            if (accepted.length === 0)
-+                finish();
-+            else
-+                Promise.allSettled(accepted).then(finish);
++            this._closeAfterAccepted();
          };
          this._onerror = (error) => {
              this.onerror?.(error);
-@@ -37,21 +52,34 @@ export class StdioServerTransport {
+@@ -37,21 +48,55 @@ export class StdioServerTransport {
          this._stdin.on('data', this._ondata);
          this._stdin.on('error', this._onerror);
      }
 +    _stopReading() {
 +        this._stdin.off('data', this._ondata);
-+        this._stdin.off('error', this._onerror);
 +        if (this._stdin.listenerCount('data') === 0)
 +            this._stdin.pause();
++    }
++    _track(task) {
++        this._accepted.add(task);
++        task.finally(() => {
++            this._accepted.delete(task);
++        });
++    }
++    _closeAfterAccepted() {
++        const finish = () => {
++            this.close().catch(() => { });
++        };
++        const pending = [...this._accepted];
++        if (pending.length === 0) {
++            finish();
++            return;
++        }
++        Promise.allSettled(pending).then(() => {
++            if (this._accepted.size === 0)
++                finish();
++            else
++                this._closeAfterAccepted();
++        });
 +    }
      processReadBuffer() {
 +        const accepted = [];

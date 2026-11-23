@@ -361,8 +361,9 @@ node mcp/server.mjs
 incoming chunk。分段到達的訊息會先收進固定大小的區塊，讀取該則時才接合一次。同一 chunk
 可以先結束一則未超限的完整訊息，再接下一個未超限的開頭。同一 chunk 裡若有超限
 的一行，該行之前與之後的未超限訊息仍會送出；前一個 chunk 開始、由這個 chunk
-收尾的未超限訊息也會保留。已接受的請求會先完成並回覆，再回報 transport
-error 並關閉連線；之後的輸入不再讀取。不截斷或自動重試。這不是 process 記憶體上限；JSON 解碼、驗證與複製可能
+收尾的未超限訊息也會保留。已接受的請求會先完成並回覆，包含更早 chunk 仍在執行的請求，再回報
+transport error 並關閉連線。停止讀取時仍保留 stdin 的 error listener，直到
+close()。之後的輸入不再讀取。不截斷或自動重試。這不是 process 記憶體上限；JSON 解碼、驗證與複製可能
 同時使用更多記憶體。
 
 所有 MCP tool arguments 另限制 **100,000 個陣列元素與物件欄位**，在 schema
