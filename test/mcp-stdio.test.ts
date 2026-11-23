@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ReadBuffer } from "@modelcontextprotocol/sdk/shared/stdio.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod/v4";
 import { TripChangeIntentSchema } from "../src/domain/schemas.js";
 import { createChicTripStdioTransport, STDIO_MAX_BUFFER_BYTES } from "../src/mcp/stdio-transport.js";
 
@@ -231,6 +234,92 @@ describe("bounded stdio transport", () => {
       expect(h.input.listenerCount("data")).toBe(0);
     } finally { await h.close(); }
   }, 30_000);
+
+  test("packs tiny unfinished fragments into fixed blocks", () => {
+    const buffer = new ReadBuffer({ maxBufferSize: 200_000 });
+    const piece = Buffer.from("x");
+    const count = 100_000;
+    for (let index = 0; index < count; index++) buffer.append(piece);
+    const stored = (buffer as unknown as { _chunks: Buffer[] })._chunks;
+    expect(stored.length).toBeLessThan(count / 1000);
+    expect(stored.reduce((sum, chunk) => sum + chunk.length, 0)).toBe(count);
+  });
+
+  test("replies to a tool call that shares a chunk with an oversized line", async () => {
+    const calls: string[] = [];
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const server = new McpServer({ name: "stub", version: "0.0.0" });
+    server.registerTool(
+      "stub_echo",
+      {
+        description: "Echo one string.",
+        inputSchema: { text: z.string() },
+      },
+      async ({ text }) => {
+        calls.push(text);
+        await Promise.resolve();
+        return { content: [{ type: "text", text }] };
+      },
+    );
+    const transport = new StdioServerTransport(input, output, { maxBufferSize: 4_096 });
+    const stdout: string[] = [];
+    output.on("data", (chunk) => stdout.push(chunk.toString("utf8")));
+    await server.connect(transport);
+    const write = (message: unknown) => {
+      input.write(`${JSON.stringify(message)}\n`);
+    };
+    const waitFor = (id: number) => new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`no reply for id ${id}`)), 2_000);
+      const onData = () => {
+        if (stdout.join("").includes(`"id":${id}`)) {
+          clearTimeout(timeout);
+          output.off("data", onData);
+          resolve();
+        }
+      };
+      output.on("data", onData);
+      onData();
+    });
+    try {
+      write({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "test", version: "0" },
+        },
+      });
+      await waitFor(1);
+      write({ jsonrpc: "2.0", method: "notifications/initialized" });
+      const call = {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "stub_echo", arguments: { text: "kept" } },
+      };
+      const callBytes = Buffer.from(`${JSON.stringify(call)}\n`);
+      expect(callBytes.length).toBeLessThan(4_096);
+      const oversized = Buffer.alloc(4_097, 32);
+      oversized[oversized.length - 1] = 10;
+      input.write(Buffer.concat([callBytes, oversized]));
+      await waitFor(2);
+      expect(calls).toEqual(["kept"]);
+      expect(stdout.join("")).toContain("kept");
+      input.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "stub_echo", arguments: { text: "late" } },
+      })}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(calls).toEqual(["kept"]);
+    } finally {
+      await server.close();
+    }
+  });
 
   test("continues parsing consecutive small messages", async () => {
     const h = await harness();

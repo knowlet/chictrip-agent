@@ -21717,12 +21717,15 @@ class UrlElicitationRequiredError extends McpError {
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/shared/stdio.js
 var STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+var READ_BLOCK_BYTES = 16 * 1024;
 
 class ReadBuffer {
   constructor(options) {
     this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
     this._chunks = [];
     this._head = 0;
+    this._openBlock = undefined;
+    this._openUsed = 0;
     this._length = 0;
     this._pending = 0;
   }
@@ -21793,14 +21796,44 @@ class ReadBuffer {
   clear() {
     this._chunks = [];
     this._head = 0;
+    this._openBlock = undefined;
+    this._openUsed = 0;
     this._length = 0;
     this._pending = 0;
   }
   _push(chunk) {
     if (chunk.length === 0)
       return;
-    this._chunks.push(chunk);
-    this._length += chunk.length;
+    if (chunk.length >= READ_BLOCK_BYTES) {
+      this._openBlock = undefined;
+      this._openUsed = 0;
+      this._chunks.push(chunk);
+      this._length += chunk.length;
+      return;
+    }
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (!this._openBlock || this._openUsed === READ_BLOCK_BYTES) {
+        this._openBlock = Buffer.allocUnsafe(READ_BLOCK_BYTES);
+        this._openUsed = 0;
+        this._chunks.push(this._openBlock.subarray(0, 0));
+      }
+      const room = READ_BLOCK_BYTES - this._openUsed;
+      const take = Math.min(room, chunk.length - offset);
+      chunk.copy(this._openBlock, this._openUsed, offset, offset + take);
+      this._openUsed += take;
+      this._length += take;
+      offset += take;
+      this._chunks[this._chunks.length - 1] = this._openBlock.subarray(0, this._openUsed);
+      if (this._openUsed === READ_BLOCK_BYTES) {
+        this._openBlock = undefined;
+        this._openUsed = 0;
+      }
+    }
+  }
+  _releaseOpenBlock() {
+    this._openBlock = undefined;
+    this._openUsed = 0;
   }
   _discardPending() {
     let drop = this._pending;
@@ -21817,6 +21850,7 @@ class ReadBuffer {
       }
     }
     this._pending = 0;
+    this._releaseOpenBlock();
   }
   _take(byteCount) {
     const parts = [];
@@ -21837,6 +21871,7 @@ class ReadBuffer {
     const consumed = index - this._head;
     if (consumed > 0)
       this._chunks.splice(this._head, consumed);
+    this._releaseOpenBlock();
     this._length -= byteCount;
     if (parts.length === 1)
       return parts[0];
@@ -21857,6 +21892,7 @@ class StdioServerTransport {
     this._stdin = _stdin;
     this._stdout = _stdout;
     this._started = false;
+    this._closed = false;
     this._ondata = (chunk) => {
       let overflow;
       try {
@@ -21864,11 +21900,19 @@ class StdioServerTransport {
       } catch (error51) {
         overflow = error51;
       }
-      this.processReadBuffer();
-      if (overflow) {
-        this.onerror?.(overflow);
+      if (overflow)
+        this._stopReading();
+      const accepted = this.processReadBuffer();
+      if (!overflow)
+        return;
+      this.onerror?.(overflow);
+      const finish = () => {
         this.close().catch(() => {});
-      }
+      };
+      if (accepted.length === 0)
+        finish();
+      else
+        Promise.allSettled(accepted).then(finish);
     };
     this._onerror = (error51) => {
       this.onerror?.(error51);
@@ -21883,20 +21927,33 @@ class StdioServerTransport {
     this._stdin.on("data", this._ondata);
     this._stdin.on("error", this._onerror);
   }
+  _stopReading() {
+    this._stdin.off("data", this._ondata);
+    this._stdin.off("error", this._onerror);
+    if (this._stdin.listenerCount("data") === 0)
+      this._stdin.pause();
+  }
   processReadBuffer() {
+    const accepted = [];
     while (true) {
       try {
         const message = this._readBuffer.readMessage();
         if (message === null) {
           break;
         }
-        this.onmessage?.(message);
+        const result = this.onmessage?.(message);
+        if (result && typeof result.then === "function")
+          accepted.push(result);
       } catch (error51) {
         this.onerror?.(error51);
       }
     }
+    return accepted;
   }
   async close() {
+    if (this._closed)
+      return;
+    this._closed = true;
     this._stdin.off("data", this._ondata);
     this._stdin.off("error", this._onerror);
     const remainingDataListeners = this._stdin.listenerCount("data");
@@ -29904,7 +29961,7 @@ class Protocol {
       if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) {
         this._onresponse(message);
       } else if (isJSONRPCRequest(message)) {
-        this._onrequest(message, extra);
+        return this._onrequest(message, extra);
       } else if (isJSONRPCNotification(message)) {
         this._onnotification(message);
       } else {
@@ -30024,7 +30081,7 @@ class Protocol {
       closeSSEStream: extra?.closeSSEStream,
       closeStandaloneSSEStream: extra?.closeStandaloneSSEStream
     };
-    (relatedTaskLookup ?? Promise.resolve()).then(() => {
+    return (relatedTaskLookup ?? Promise.resolve()).then(() => {
       if (relatedTaskLookup && abortController.signal.aborted) {
         throw new McpError(ErrorCode.ConnectionClosed, "Request was cancelled");
       }
@@ -32289,4 +32346,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=48F1C7F73EF6A34F64756E2164756E21
+//# debugId=3AE4528F93E6736364756E2164756E21
