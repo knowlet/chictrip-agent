@@ -123,6 +123,61 @@ describe("bounded stdio transport", () => {
     expect(buffer.readMessage()).toBeNull();
   }, 30_000);
 
+  test("keeps a split message when the completing chunk also has an oversized line", () => {
+    const limit = 128;
+    const buffer = new ReadBuffer({ maxBufferSize: limit });
+    const message = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+    expect(message.length).toBeLessThan(limit);
+    const split = Math.floor(message.length / 2);
+    buffer.append(message.subarray(0, split));
+    const oversized = Buffer.alloc(limit + 1, 32);
+    oversized[oversized.length - 1] = 10;
+    let caught: unknown;
+    try {
+      buffer.append(Buffer.concat([message.subarray(split), oversized]));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain(`exceeded maximum size of ${limit} bytes`);
+    expect(buffer.readMessage()).toEqual({ jsonrpc: "2.0", id: 1, method: "ping" });
+    expect(buffer.readMessage()).toBeNull();
+  });
+
+  test("drains 128k fragments under Node with one splice", async () => {
+    const script = `
+      import { ReadBuffer } from "@modelcontextprotocol/sdk/shared/stdio.js";
+      const count = 128000;
+      const buffer = new ReadBuffer({ maxBufferSize: count + 64 });
+      const head = Buffer.from('{"jsonrpc":"2.0","method":"ping"}');
+      buffer.append(head);
+      const space = Buffer.from(" ");
+      for (let index = 0; index < count; index++) buffer.append(space);
+      buffer.append(Buffer.from("\\n"));
+      const started = performance.now();
+      const message = buffer.readMessage();
+      const elapsed = performance.now() - started;
+      if (!message || message.method !== "ping") process.exit(2);
+      if (elapsed >= 1000) {
+        console.error(elapsed.toFixed(1));
+        process.exit(3);
+      }
+      console.log(elapsed.toFixed(1));
+    `;
+    const child = Bun.spawn(["node", "--input-type=module", "-e", script], {
+      cwd: import.meta.dir + "/..",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect({ exitCode, stderr, stdout: stdout.trim() }).toMatchObject({ exitCode: 0 });
+    expect(Number(stdout.trim())).toBeLessThan(1_000);
+  }, 20_000);
+
   test("keeps valid messages when the same chunk contains an oversized line", () => {
     const limit = 128;
     const buffer = new ReadBuffer({ maxBufferSize: limit });

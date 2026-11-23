@@ -1,3 +1,6 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-aba934b20d84e731 b/.bun-tag-aba934b20d84e731
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-f9906267995c0bcd b/.bun-tag-f9906267995c0bcd
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
@@ -50,14 +53,15 @@ index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..446e5394a612796613c7bf66045c6893
              }
          };
 diff --git a/dist/cjs/shared/stdio.js b/dist/cjs/shared/stdio.js
-index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcffebe278d8 100644
+index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..4720b491fe815bdf20fc4b0a914c4757d19296a4 100644
 --- a/dist/cjs/shared/stdio.js
 +++ b/dist/cjs/shared/stdio.js
-@@ -11,29 +11,125 @@ exports.STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+@@ -11,29 +11,134 @@ exports.STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
  class ReadBuffer {
      constructor(options) {
          this._maxBufferSize = options?.maxBufferSize ?? exports.STDIO_DEFAULT_MAX_BUFFER_SIZE;
 +        this._chunks = [];
++        this._head = 0;
 +        this._length = 0;
 +        // Bytes after the last newline. Complete messages already stored are not included.
 +        this._pending = 0;
@@ -83,7 +87,10 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcff
 +            const lineEnd = unterminated ? chunk.length : newline + 1;
 +            const lineBytes = pending + (lineEnd - cursor);
 +            if (lineBytes > this._maxBufferSize) {
-+                this._discardPending();
++                // Drop stored bytes only when this oversized line continues them.
++                // A newline earlier in this chunk already finished that message.
++                if (pending > 0)
++                    this._discardPending();
 +                if (cursor > keepFrom)
 +                    this._push(chunk.subarray(keepFrom, cursor));
 +                overflow = true;
@@ -117,7 +124,7 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcff
              return null;
 +        let seen = 0;
 +        let newlineAt = -1;
-+        for (let index = 0; index < this._chunks.length; index++) {
++        for (let index = this._head; index < this._chunks.length; index++) {
 +            const newline = this._chunks[index].indexOf(10);
 +            if (newline !== -1) {
 +                newlineAt = seen + newline;
@@ -141,6 +148,7 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcff
      clear() {
 -        this._buffer = undefined;
 +        this._chunks = [];
++        this._head = 0;
 +        this._length = 0;
 +        this._pending = 0;
 +    }
@@ -155,7 +163,7 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcff
 +        if (drop === 0)
 +            return;
 +        this._length -= drop;
-+        while (drop > 0 && this._chunks.length > 0) {
++        while (drop > 0 && this._chunks.length > this._head) {
 +            const last = this._chunks.pop();
 +            if (last.length <= drop) {
 +                drop -= last.length;
@@ -170,19 +178,23 @@ index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcff
 +    _take(byteCount) {
 +        const parts = [];
 +        let need = byteCount;
++        let index = this._head;
 +        while (need > 0) {
-+            const chunk = this._chunks[0];
++            const chunk = this._chunks[index];
 +            if (chunk.length <= need) {
 +                parts.push(chunk);
 +                need -= chunk.length;
-+                this._chunks.shift();
++                index += 1;
 +            }
 +            else {
 +                parts.push(chunk.subarray(0, need));
-+                this._chunks[0] = chunk.subarray(need);
++                this._chunks[index] = chunk.subarray(need);
 +                need = 0;
 +            }
 +        }
++        const consumed = index - this._head;
++        if (consumed > 0)
++            this._chunks.splice(this._head, consumed);
 +        this._length -= byteCount;
 +        if (parts.length === 1)
 +            return parts[0];
@@ -239,14 +251,15 @@ index 76e877ede5f84d172e1ced16be24845112fc152c..ccd2e4780ea2d5739f37a843b613edc7
              }
          };
 diff --git a/dist/esm/shared/stdio.js b/dist/esm/shared/stdio.js
-index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d9dc71164 100644
+index cf20e652c2f8fb6444559e8dae7dc259b310acd6..f7a62a25874cb29bebd7387060c587553d9adbd6 100644
 --- a/dist/esm/shared/stdio.js
 +++ b/dist/esm/shared/stdio.js
-@@ -6,29 +6,125 @@ export const STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+@@ -6,29 +6,134 @@ export const STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
  export class ReadBuffer {
      constructor(options) {
          this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
 +        this._chunks = [];
++        this._head = 0;
 +        this._length = 0;
 +        // Bytes after the last newline. Complete messages already stored are not included.
 +        this._pending = 0;
@@ -272,7 +285,10 @@ index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d
 +            const lineEnd = unterminated ? chunk.length : newline + 1;
 +            const lineBytes = pending + (lineEnd - cursor);
 +            if (lineBytes > this._maxBufferSize) {
-+                this._discardPending();
++                // Drop stored bytes only when this oversized line continues them.
++                // A newline earlier in this chunk already finished that message.
++                if (pending > 0)
++                    this._discardPending();
 +                if (cursor > keepFrom)
 +                    this._push(chunk.subarray(keepFrom, cursor));
 +                overflow = true;
@@ -306,7 +322,7 @@ index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d
              return null;
 +        let seen = 0;
 +        let newlineAt = -1;
-+        for (let index = 0; index < this._chunks.length; index++) {
++        for (let index = this._head; index < this._chunks.length; index++) {
 +            const newline = this._chunks[index].indexOf(10);
 +            if (newline !== -1) {
 +                newlineAt = seen + newline;
@@ -330,6 +346,7 @@ index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d
      clear() {
 -        this._buffer = undefined;
 +        this._chunks = [];
++        this._head = 0;
 +        this._length = 0;
 +        this._pending = 0;
 +    }
@@ -344,7 +361,7 @@ index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d
 +        if (drop === 0)
 +            return;
 +        this._length -= drop;
-+        while (drop > 0 && this._chunks.length > 0) {
++        while (drop > 0 && this._chunks.length > this._head) {
 +            const last = this._chunks.pop();
 +            if (last.length <= drop) {
 +                drop -= last.length;
@@ -359,19 +376,23 @@ index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d
 +    _take(byteCount) {
 +        const parts = [];
 +        let need = byteCount;
++        let index = this._head;
 +        while (need > 0) {
-+            const chunk = this._chunks[0];
++            const chunk = this._chunks[index];
 +            if (chunk.length <= need) {
 +                parts.push(chunk);
 +                need -= chunk.length;
-+                this._chunks.shift();
++                index += 1;
 +            }
 +            else {
 +                parts.push(chunk.subarray(0, need));
-+                this._chunks[0] = chunk.subarray(need);
++                this._chunks[index] = chunk.subarray(need);
 +                need = 0;
 +            }
 +        }
++        const consumed = index - this._head;
++        if (consumed > 0)
++            this._chunks.splice(this._head, consumed);
 +        this._length -= byteCount;
 +        if (parts.length === 1)
 +            return parts[0];

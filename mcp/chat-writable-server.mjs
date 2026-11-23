@@ -21722,6 +21722,7 @@ class ReadBuffer {
   constructor(options) {
     this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
     this._chunks = [];
+    this._head = 0;
     this._length = 0;
     this._pending = 0;
   }
@@ -21740,7 +21741,8 @@ class ReadBuffer {
       const lineEnd = unterminated ? chunk.length : newline + 1;
       const lineBytes = pending + (lineEnd - cursor);
       if (lineBytes > this._maxBufferSize) {
-        this._discardPending();
+        if (pending > 0)
+          this._discardPending();
         if (cursor > keepFrom)
           this._push(chunk.subarray(keepFrom, cursor));
         overflow = true;
@@ -21772,7 +21774,7 @@ class ReadBuffer {
       return null;
     let seen = 0;
     let newlineAt = -1;
-    for (let index = 0;index < this._chunks.length; index++) {
+    for (let index = this._head;index < this._chunks.length; index++) {
       const newline = this._chunks[index].indexOf(10);
       if (newline !== -1) {
         newlineAt = seen + newline;
@@ -21790,6 +21792,7 @@ class ReadBuffer {
   }
   clear() {
     this._chunks = [];
+    this._head = 0;
     this._length = 0;
     this._pending = 0;
   }
@@ -21804,7 +21807,7 @@ class ReadBuffer {
     if (drop === 0)
       return;
     this._length -= drop;
-    while (drop > 0 && this._chunks.length > 0) {
+    while (drop > 0 && this._chunks.length > this._head) {
       const last = this._chunks.pop();
       if (last.length <= drop) {
         drop -= last.length;
@@ -21818,18 +21821,22 @@ class ReadBuffer {
   _take(byteCount) {
     const parts = [];
     let need = byteCount;
+    let index = this._head;
     while (need > 0) {
-      const chunk = this._chunks[0];
+      const chunk = this._chunks[index];
       if (chunk.length <= need) {
         parts.push(chunk);
         need -= chunk.length;
-        this._chunks.shift();
+        index += 1;
       } else {
         parts.push(chunk.subarray(0, need));
-        this._chunks[0] = chunk.subarray(need);
+        this._chunks[index] = chunk.subarray(need);
         need = 0;
       }
     }
+    const consumed = index - this._head;
+    if (consumed > 0)
+      this._chunks.splice(this._head, consumed);
     this._length -= byteCount;
     if (parts.length === 1)
       return parts[0];
@@ -32282,4 +32289,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=83DE78D3DC006CEE64756E2164756E21
+//# debugId=48F1C7F73EF6A34F64756E2164756E21
