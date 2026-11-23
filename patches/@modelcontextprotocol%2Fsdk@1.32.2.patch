@@ -1,0 +1,775 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-1d969b9db2ad360d b/.bun-tag-1d969b9db2ad360d
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-4416cac1e31f1574 b/.bun-tag-4416cac1e31f1574
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-aba934b20d84e731 b/.bun-tag-aba934b20d84e731
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-f9906267995c0bcd b/.bun-tag-f9906267995c0bcd
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/cjs/client/stdio.js b/dist/cjs/client/stdio.js
+index aabab78421a9b2e3981cf2ca138ea33494603a26..01d4640f3ffdb09a0b904ff37b8735d8bff5e82c 100644
+--- a/dist/cjs/client/stdio.js
++++ b/dist/cjs/client/stdio.js
+@@ -94,16 +94,41 @@ class StdioClientTransport {
+             this._process.stdin?.on('error', error => {
+                 this.onerror?.(error);
+             });
+-            this._process.stdout?.on('data', chunk => {
++            this._accepted = new Set();
++            this._onstdout = (chunk) => {
++                let overflow;
+                 try {
+                     this._readBuffer.append(chunk);
+-                    this.processReadBuffer();
+                 }
+                 catch (error) {
+-                    this.onerror?.(error);
+-                    this.close().catch(() => { });
++                    overflow = error;
+                 }
+-            });
++                if (overflow)
++                    this._process?.stdout?.off('data', this._onstdout);
++                for (const task of this.processReadBuffer()) {
++                    this._accepted.add(task);
++                    task.finally(() => {
++                        this._accepted.delete(task);
++                    });
++                }
++                if (!overflow)
++                    return;
++                this.onerror?.(overflow);
++                const finish = () => {
++                    this.close().catch(() => { });
++                };
++                const pending = [...this._accepted];
++                if (pending.length === 0)
++                    finish();
++                else
++                    Promise.allSettled(pending).then(() => {
++                        if (this._accepted.size === 0)
++                            finish();
++                        else
++                            Promise.allSettled([...this._accepted]).then(finish);
++                    });
++            };
++            this._process.stdout?.on('data', this._onstdout);
+             this._process.stdout?.on('error', error => {
+                 this.onerror?.(error);
+             });
+@@ -134,18 +159,22 @@ class StdioClientTransport {
+         return this._process?.pid ?? null;
+     }
+     processReadBuffer() {
++        const accepted = [];
+         while (true) {
+             try {
+                 const message = this._readBuffer.readMessage();
+                 if (message === null) {
+                     break;
+                 }
+-                this.onmessage?.(message);
++                const result = this.onmessage?.(message);
++                if (result && typeof result.then === 'function')
++                    accepted.push(result);
+             }
+             catch (error) {
+                 this.onerror?.(error);
+             }
+         }
++        return accepted;
+     }
+     async close() {
+         if (this._process) {
+diff --git a/dist/cjs/server/stdio.js b/dist/cjs/server/stdio.js
+index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..47726cdaee27d7a41ac04031ba24fba7e07a9b1f 100644
+--- a/dist/cjs/server/stdio.js
++++ b/dist/cjs/server/stdio.js
+@@ -16,16 +16,27 @@ class StdioServerTransport {
+         this._stdin = _stdin;
+         this._stdout = _stdout;
+         this._started = false;
++        this._closed = false;
++        // Requests accepted on earlier chunks stay here until they settle.
++        this._accepted = new Set();
+         // Arrow functions to bind `this` properly, while maintaining function identity.
+         this._ondata = (chunk) => {
++            let overflow;
+             try {
+                 this._readBuffer.append(chunk);
+-                this.processReadBuffer();
+             }
+             catch (error) {
+-                this.onerror?.(error);
+-                this.close().catch(() => { });
++                overflow = error;
+             }
++            // Stop further reads. Keep the stdin error listener until close().
++            if (overflow)
++                this._stopReading();
++            for (const task of this.processReadBuffer())
++                this._track(task);
++            if (!overflow)
++                return;
++            this.onerror?.(overflow);
++            this._closeAfterAccepted();
+         };
+         this._onerror = (error) => {
+             this.onerror?.(error);
+@@ -43,21 +54,55 @@ class StdioServerTransport {
+         this._stdin.on('data', this._ondata);
+         this._stdin.on('error', this._onerror);
+     }
++    _stopReading() {
++        this._stdin.off('data', this._ondata);
++        if (this._stdin.listenerCount('data') === 0)
++            this._stdin.pause();
++    }
++    _track(task) {
++        this._accepted.add(task);
++        task.finally(() => {
++            this._accepted.delete(task);
++        });
++    }
++    _closeAfterAccepted() {
++        const finish = () => {
++            this.close().catch(() => { });
++        };
++        const pending = [...this._accepted];
++        if (pending.length === 0) {
++            finish();
++            return;
++        }
++        Promise.allSettled(pending).then(() => {
++            if (this._accepted.size === 0)
++                finish();
++            else
++                this._closeAfterAccepted();
++        });
++    }
+     processReadBuffer() {
++        const accepted = [];
+         while (true) {
+             try {
+                 const message = this._readBuffer.readMessage();
+                 if (message === null) {
+                     break;
+                 }
+-                this.onmessage?.(message);
++                const result = this.onmessage?.(message);
++                if (result && typeof result.then === 'function')
++                    accepted.push(result);
+             }
+             catch (error) {
+                 this.onerror?.(error);
+             }
+         }
++        return accepted;
+     }
+     async close() {
++        if (this._closed)
++            return;
++        this._closed = true;
+         // Remove our event listeners first
+         this._stdin.off('data', this._ondata);
+         this._stdin.off('error', this._onerror);
+diff --git a/dist/cjs/shared/protocol.js b/dist/cjs/shared/protocol.js
+index 2eaacb785f5d029c409be1383d11ac3612d61289..6272db135d584053b2bca3defefeb2caa1e6149e 100644
+--- a/dist/cjs/shared/protocol.js
++++ b/dist/cjs/shared/protocol.js
+@@ -242,7 +242,8 @@ class Protocol {
+                 this._onresponse(message);
+             }
+             else if ((0, types_js_1.isJSONRPCRequest)(message)) {
+-                this._onrequest(message, extra);
++                // Returned so the transport can finish this request before closing.
++                return this._onrequest(message, extra);
+             }
+             else if ((0, types_js_1.isJSONRPCNotification)(message)) {
+                 this._onnotification(message);
+@@ -384,7 +385,7 @@ class Protocol {
+             closeStandaloneSSEStream: extra?.closeStandaloneSSEStream
+         };
+         // Starting with Promise.resolve() puts any synchronous errors into the monad as well.
+-        (relatedTaskLookup ?? Promise.resolve())
++        return (relatedTaskLookup ?? Promise.resolve())
+             .then(() => {
+             // A request cancelled while its related task was looked up does not start its handler; nothing is replied.
+             if (relatedTaskLookup && abortController.signal.aborted) {
+diff --git a/dist/cjs/shared/stdio.js b/dist/cjs/shared/stdio.js
+index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..f87810dfaabb75fd3ddbe513ead185ebb6468fc5 100644
+--- a/dist/cjs/shared/stdio.js
++++ b/dist/cjs/shared/stdio.js
+@@ -5,35 +5,176 @@ exports.deserializeMessage = deserializeMessage;
+ exports.serializeMessage = serializeMessage;
+ const types_js_1 = require("../types.js");
+ exports.STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
++// Small reads share these blocks so a fragment cannot pin its own allocation.
++const READ_BLOCK_BYTES = 16 * 1024;
+ /**
+  * Buffers a continuous stdio stream into discrete JSON-RPC messages.
+  */
+ class ReadBuffer {
+     constructor(options) {
+         this._maxBufferSize = options?.maxBufferSize ?? exports.STDIO_DEFAULT_MAX_BUFFER_SIZE;
++        this._chunks = [];
++        this._head = 0;
++        this._openBlock = undefined;
++        this._openUsed = 0;
++        this._length = 0;
++        // Bytes after the last newline. Complete messages already stored are not included.
++        this._pending = 0;
+     }
+     append(chunk) {
+-        const newSize = (this._buffer?.length ?? 0) + chunk.length;
+-        if (newSize > this._maxBufferSize) {
+-            this.clear();
++        if (!Buffer.isBuffer(chunk))
++            chunk = Buffer.from(chunk);
++        if (chunk.length === 0)
++            return;
++        // Keep the incoming pieces and copy them once, when a message is read.
++        // The limit is bytes since the previous newline, including that
++        // message's terminating newline.
++        let cursor = 0;
++        let pending = this._pending;
++        let keepFrom = 0;
++        let overflow = false;
++        while (cursor < chunk.length) {
++            const newline = chunk.indexOf(10, cursor);
++            const unterminated = newline === -1;
++            const lineEnd = unterminated ? chunk.length : newline + 1;
++            const lineBytes = pending + (lineEnd - cursor);
++            if (lineBytes > this._maxBufferSize) {
++                // Drop stored bytes only when this oversized line continues them.
++                // A newline earlier in this chunk already finished that message.
++                if (pending > 0)
++                    this._discardPending();
++                if (cursor > keepFrom)
++                    this._push(chunk.subarray(keepFrom, cursor));
++                overflow = true;
++                pending = 0;
++                if (unterminated) {
++                    keepFrom = chunk.length;
++                    break;
++                }
++                cursor = lineEnd;
++                keepFrom = lineEnd;
++                continue;
++            }
++            if (unterminated) {
++                pending = lineBytes;
++                break;
++            }
++            pending = 0;
++            cursor = lineEnd;
++        }
++        if (keepFrom < chunk.length)
++            this._push(chunk.subarray(keepFrom));
++        this._pending = pending;
++        if (overflow) {
+             throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+         }
+-        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
+     }
+     readMessage() {
+-        if (!this._buffer) {
++        if (this._length === 0 || this._pending === this._length)
+             return null;
++        let seen = 0;
++        let newlineAt = -1;
++        for (let index = this._head; index < this._chunks.length; index++) {
++            const newline = this._chunks[index].indexOf(10);
++            if (newline !== -1) {
++                newlineAt = seen + newline;
++                break;
++            }
++            seen += this._chunks[index].length;
+         }
+-        const index = this._buffer.indexOf('\n');
+-        if (index === -1) {
++        if (newlineAt === -1)
+             return null;
+-        }
+-        const line = this._buffer.toString('utf8', 0, index).replace(/\r$/, '');
+-        this._buffer = this._buffer.subarray(index + 1);
++        const taken = this._take(newlineAt + 1);
++        let line = taken.toString('utf8', 0, newlineAt);
++        if (line.endsWith('\r'))
++            line = line.slice(0, -1);
+         return deserializeMessage(line);
+     }
+     clear() {
+-        this._buffer = undefined;
++        this._chunks = [];
++        this._head = 0;
++        this._openBlock = undefined;
++        this._openUsed = 0;
++        this._length = 0;
++        this._pending = 0;
++    }
++    _push(chunk) {
++        if (chunk.length === 0)
++            return;
++        if (chunk.length >= READ_BLOCK_BYTES) {
++            this._openBlock = undefined;
++            this._openUsed = 0;
++            this._chunks.push(chunk);
++            this._length += chunk.length;
++            return;
++        }
++        let offset = 0;
++        while (offset < chunk.length) {
++            if (!this._openBlock || this._openUsed === READ_BLOCK_BYTES) {
++                this._openBlock = Buffer.allocUnsafe(READ_BLOCK_BYTES);
++                this._openUsed = 0;
++                this._chunks.push(this._openBlock.subarray(0, 0));
++            }
++            const room = READ_BLOCK_BYTES - this._openUsed;
++            const take = Math.min(room, chunk.length - offset);
++            chunk.copy(this._openBlock, this._openUsed, offset, offset + take);
++            this._openUsed += take;
++            this._length += take;
++            offset += take;
++            this._chunks[this._chunks.length - 1] = this._openBlock.subarray(0, this._openUsed);
++            if (this._openUsed === READ_BLOCK_BYTES) {
++                this._openBlock = undefined;
++                this._openUsed = 0;
++            }
++        }
++    }
++    _releaseOpenBlock() {
++        this._openBlock = undefined;
++        this._openUsed = 0;
++    }
++    _discardPending() {
++        let drop = this._pending;
++        if (drop === 0)
++            return;
++        this._length -= drop;
++        while (drop > 0 && this._chunks.length > this._head) {
++            const last = this._chunks.pop();
++            if (last.length <= drop) {
++                drop -= last.length;
++            }
++            else {
++                this._chunks.push(last.subarray(0, last.length - drop));
++                drop = 0;
++            }
++        }
++        this._pending = 0;
++        this._releaseOpenBlock();
++    }
++    _take(byteCount) {
++        const parts = [];
++        let need = byteCount;
++        let index = this._head;
++        while (need > 0) {
++            const chunk = this._chunks[index];
++            if (chunk.length <= need) {
++                parts.push(chunk);
++                need -= chunk.length;
++                index += 1;
++            }
++            else {
++                parts.push(chunk.subarray(0, need));
++                this._chunks[index] = chunk.subarray(need);
++                need = 0;
++            }
++        }
++        const consumed = index - this._head;
++        if (consumed > 0)
++            this._chunks.splice(this._head, consumed);
++        this._releaseOpenBlock();
++        this._length -= byteCount;
++        if (parts.length === 1)
++            return parts[0];
++        return Buffer.concat(parts, byteCount);
+     }
+ }
+ exports.ReadBuffer = ReadBuffer;
+diff --git a/dist/esm/client/stdio.js b/dist/esm/client/stdio.js
+index 925ad2160eebfe8bc7390a889d850ba547c494fa..f0edfee1300493922c94da92235eb845a2993635 100644
+--- a/dist/esm/client/stdio.js
++++ b/dist/esm/client/stdio.js
+@@ -87,16 +87,41 @@ export class StdioClientTransport {
+             this._process.stdin?.on('error', error => {
+                 this.onerror?.(error);
+             });
+-            this._process.stdout?.on('data', chunk => {
++            this._accepted = new Set();
++            this._onstdout = (chunk) => {
++                let overflow;
+                 try {
+                     this._readBuffer.append(chunk);
+-                    this.processReadBuffer();
+                 }
+                 catch (error) {
+-                    this.onerror?.(error);
+-                    this.close().catch(() => { });
++                    overflow = error;
+                 }
+-            });
++                if (overflow)
++                    this._process?.stdout?.off('data', this._onstdout);
++                for (const task of this.processReadBuffer()) {
++                    this._accepted.add(task);
++                    task.finally(() => {
++                        this._accepted.delete(task);
++                    });
++                }
++                if (!overflow)
++                    return;
++                this.onerror?.(overflow);
++                const finish = () => {
++                    this.close().catch(() => { });
++                };
++                const pending = [...this._accepted];
++                if (pending.length === 0)
++                    finish();
++                else
++                    Promise.allSettled(pending).then(() => {
++                        if (this._accepted.size === 0)
++                            finish();
++                        else
++                            Promise.allSettled([...this._accepted]).then(finish);
++                    });
++            };
++            this._process.stdout?.on('data', this._onstdout);
+             this._process.stdout?.on('error', error => {
+                 this.onerror?.(error);
+             });
+@@ -127,18 +152,22 @@ export class StdioClientTransport {
+         return this._process?.pid ?? null;
+     }
+     processReadBuffer() {
++        const accepted = [];
+         while (true) {
+             try {
+                 const message = this._readBuffer.readMessage();
+                 if (message === null) {
+                     break;
+                 }
+-                this.onmessage?.(message);
++                const result = this.onmessage?.(message);
++                if (result && typeof result.then === 'function')
++                    accepted.push(result);
+             }
+             catch (error) {
+                 this.onerror?.(error);
+             }
+         }
++        return accepted;
+     }
+     async close() {
+         if (this._process) {
+diff --git a/dist/esm/server/stdio.js b/dist/esm/server/stdio.js
+index 76e877ede5f84d172e1ced16be24845112fc152c..77af4762ec6e7872f24cdddd66df8dcb1d66b93f 100644
+--- a/dist/esm/server/stdio.js
++++ b/dist/esm/server/stdio.js
+@@ -10,16 +10,27 @@ export class StdioServerTransport {
+         this._stdin = _stdin;
+         this._stdout = _stdout;
+         this._started = false;
++        this._closed = false;
++        // Requests accepted on earlier chunks stay here until they settle.
++        this._accepted = new Set();
+         // Arrow functions to bind `this` properly, while maintaining function identity.
+         this._ondata = (chunk) => {
++            let overflow;
+             try {
+                 this._readBuffer.append(chunk);
+-                this.processReadBuffer();
+             }
+             catch (error) {
+-                this.onerror?.(error);
+-                this.close().catch(() => { });
++                overflow = error;
+             }
++            // Stop further reads. Keep the stdin error listener until close().
++            if (overflow)
++                this._stopReading();
++            for (const task of this.processReadBuffer())
++                this._track(task);
++            if (!overflow)
++                return;
++            this.onerror?.(overflow);
++            this._closeAfterAccepted();
+         };
+         this._onerror = (error) => {
+             this.onerror?.(error);
+@@ -37,21 +48,55 @@ export class StdioServerTransport {
+         this._stdin.on('data', this._ondata);
+         this._stdin.on('error', this._onerror);
+     }
++    _stopReading() {
++        this._stdin.off('data', this._ondata);
++        if (this._stdin.listenerCount('data') === 0)
++            this._stdin.pause();
++    }
++    _track(task) {
++        this._accepted.add(task);
++        task.finally(() => {
++            this._accepted.delete(task);
++        });
++    }
++    _closeAfterAccepted() {
++        const finish = () => {
++            this.close().catch(() => { });
++        };
++        const pending = [...this._accepted];
++        if (pending.length === 0) {
++            finish();
++            return;
++        }
++        Promise.allSettled(pending).then(() => {
++            if (this._accepted.size === 0)
++                finish();
++            else
++                this._closeAfterAccepted();
++        });
++    }
+     processReadBuffer() {
++        const accepted = [];
+         while (true) {
+             try {
+                 const message = this._readBuffer.readMessage();
+                 if (message === null) {
+                     break;
+                 }
+-                this.onmessage?.(message);
++                const result = this.onmessage?.(message);
++                if (result && typeof result.then === 'function')
++                    accepted.push(result);
+             }
+             catch (error) {
+                 this.onerror?.(error);
+             }
+         }
++        return accepted;
+     }
+     async close() {
++        if (this._closed)
++            return;
++        this._closed = true;
+         // Remove our event listeners first
+         this._stdin.off('data', this._ondata);
+         this._stdin.off('error', this._onerror);
+diff --git a/dist/esm/shared/protocol.js b/dist/esm/shared/protocol.js
+index 58100ad810fbca912148a5a3880242e7ccc59861..d7e1fccc683205e17f130a24c7a5f201c1f750ed 100644
+--- a/dist/esm/shared/protocol.js
++++ b/dist/esm/shared/protocol.js
+@@ -238,7 +238,8 @@ export class Protocol {
+                 this._onresponse(message);
+             }
+             else if (isJSONRPCRequest(message)) {
+-                this._onrequest(message, extra);
++                // Returned so the transport can finish this request before closing.
++                return this._onrequest(message, extra);
+             }
+             else if (isJSONRPCNotification(message)) {
+                 this._onnotification(message);
+@@ -380,7 +381,7 @@ export class Protocol {
+             closeStandaloneSSEStream: extra?.closeStandaloneSSEStream
+         };
+         // Starting with Promise.resolve() puts any synchronous errors into the monad as well.
+-        (relatedTaskLookup ?? Promise.resolve())
++        return (relatedTaskLookup ?? Promise.resolve())
+             .then(() => {
+             // A request cancelled while its related task was looked up does not start its handler; nothing is replied.
+             if (relatedTaskLookup && abortController.signal.aborted) {
+diff --git a/dist/esm/shared/stdio.js b/dist/esm/shared/stdio.js
+index cf20e652c2f8fb6444559e8dae7dc259b310acd6..3bc5857c6d3b2be1f9e651a3f544bac348da730f 100644
+--- a/dist/esm/shared/stdio.js
++++ b/dist/esm/shared/stdio.js
+@@ -1,34 +1,175 @@
+ import { JSONRPCMessageSchema } from '../types.js';
+ export const STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
++// Small reads share these blocks so a fragment cannot pin its own allocation.
++const READ_BLOCK_BYTES = 16 * 1024;
+ /**
+  * Buffers a continuous stdio stream into discrete JSON-RPC messages.
+  */
+ export class ReadBuffer {
+     constructor(options) {
+         this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
++        this._chunks = [];
++        this._head = 0;
++        this._openBlock = undefined;
++        this._openUsed = 0;
++        this._length = 0;
++        // Bytes after the last newline. Complete messages already stored are not included.
++        this._pending = 0;
+     }
+     append(chunk) {
+-        const newSize = (this._buffer?.length ?? 0) + chunk.length;
+-        if (newSize > this._maxBufferSize) {
+-            this.clear();
++        if (!Buffer.isBuffer(chunk))
++            chunk = Buffer.from(chunk);
++        if (chunk.length === 0)
++            return;
++        // Keep the incoming pieces and copy them once, when a message is read.
++        // The limit is bytes since the previous newline, including that
++        // message's terminating newline.
++        let cursor = 0;
++        let pending = this._pending;
++        let keepFrom = 0;
++        let overflow = false;
++        while (cursor < chunk.length) {
++            const newline = chunk.indexOf(10, cursor);
++            const unterminated = newline === -1;
++            const lineEnd = unterminated ? chunk.length : newline + 1;
++            const lineBytes = pending + (lineEnd - cursor);
++            if (lineBytes > this._maxBufferSize) {
++                // Drop stored bytes only when this oversized line continues them.
++                // A newline earlier in this chunk already finished that message.
++                if (pending > 0)
++                    this._discardPending();
++                if (cursor > keepFrom)
++                    this._push(chunk.subarray(keepFrom, cursor));
++                overflow = true;
++                pending = 0;
++                if (unterminated) {
++                    keepFrom = chunk.length;
++                    break;
++                }
++                cursor = lineEnd;
++                keepFrom = lineEnd;
++                continue;
++            }
++            if (unterminated) {
++                pending = lineBytes;
++                break;
++            }
++            pending = 0;
++            cursor = lineEnd;
++        }
++        if (keepFrom < chunk.length)
++            this._push(chunk.subarray(keepFrom));
++        this._pending = pending;
++        if (overflow) {
+             throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+         }
+-        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
+     }
+     readMessage() {
+-        if (!this._buffer) {
++        if (this._length === 0 || this._pending === this._length)
+             return null;
++        let seen = 0;
++        let newlineAt = -1;
++        for (let index = this._head; index < this._chunks.length; index++) {
++            const newline = this._chunks[index].indexOf(10);
++            if (newline !== -1) {
++                newlineAt = seen + newline;
++                break;
++            }
++            seen += this._chunks[index].length;
+         }
+-        const index = this._buffer.indexOf('\n');
+-        if (index === -1) {
++        if (newlineAt === -1)
+             return null;
+-        }
+-        const line = this._buffer.toString('utf8', 0, index).replace(/\r$/, '');
+-        this._buffer = this._buffer.subarray(index + 1);
++        const taken = this._take(newlineAt + 1);
++        let line = taken.toString('utf8', 0, newlineAt);
++        if (line.endsWith('\r'))
++            line = line.slice(0, -1);
+         return deserializeMessage(line);
+     }
+     clear() {
+-        this._buffer = undefined;
++        this._chunks = [];
++        this._head = 0;
++        this._openBlock = undefined;
++        this._openUsed = 0;
++        this._length = 0;
++        this._pending = 0;
++    }
++    _push(chunk) {
++        if (chunk.length === 0)
++            return;
++        if (chunk.length >= READ_BLOCK_BYTES) {
++            this._openBlock = undefined;
++            this._openUsed = 0;
++            this._chunks.push(chunk);
++            this._length += chunk.length;
++            return;
++        }
++        let offset = 0;
++        while (offset < chunk.length) {
++            if (!this._openBlock || this._openUsed === READ_BLOCK_BYTES) {
++                this._openBlock = Buffer.allocUnsafe(READ_BLOCK_BYTES);
++                this._openUsed = 0;
++                this._chunks.push(this._openBlock.subarray(0, 0));
++            }
++            const room = READ_BLOCK_BYTES - this._openUsed;
++            const take = Math.min(room, chunk.length - offset);
++            chunk.copy(this._openBlock, this._openUsed, offset, offset + take);
++            this._openUsed += take;
++            this._length += take;
++            offset += take;
++            this._chunks[this._chunks.length - 1] = this._openBlock.subarray(0, this._openUsed);
++            if (this._openUsed === READ_BLOCK_BYTES) {
++                this._openBlock = undefined;
++                this._openUsed = 0;
++            }
++        }
++    }
++    _releaseOpenBlock() {
++        this._openBlock = undefined;
++        this._openUsed = 0;
++    }
++    _discardPending() {
++        let drop = this._pending;
++        if (drop === 0)
++            return;
++        this._length -= drop;
++        while (drop > 0 && this._chunks.length > this._head) {
++            const last = this._chunks.pop();
++            if (last.length <= drop) {
++                drop -= last.length;
++            }
++            else {
++                this._chunks.push(last.subarray(0, last.length - drop));
++                drop = 0;
++            }
++        }
++        this._pending = 0;
++        this._releaseOpenBlock();
++    }
++    _take(byteCount) {
++        const parts = [];
++        let need = byteCount;
++        let index = this._head;
++        while (need > 0) {
++            const chunk = this._chunks[index];
++            if (chunk.length <= need) {
++                parts.push(chunk);
++                need -= chunk.length;
++                index += 1;
++            }
++            else {
++                parts.push(chunk.subarray(0, need));
++                this._chunks[index] = chunk.subarray(need);
++                need = 0;
++            }
++        }
++        const consumed = index - this._head;
++        if (consumed > 0)
++            this._chunks.splice(this._head, consumed);
++        this._releaseOpenBlock();
++        this._length -= byteCount;
++        if (parts.length === 1)
++            return parts[0];
++        return Buffer.concat(parts, byteCount);
+     }
+ }
+ export function deserializeMessage(line) {

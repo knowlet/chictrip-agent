@@ -19,7 +19,7 @@
     "validate": "bun run scripts/validate.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "playwright-core": "^1.50.0",
     "zod": "^4.0.0"
   },
@@ -30,5 +30,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "patchedDependencies": {
+    "@modelcontextprotocol/sdk@1.32.2": "patches/@modelcontextprotocol%2Fsdk@1.32.2.patch"
   }
 }
