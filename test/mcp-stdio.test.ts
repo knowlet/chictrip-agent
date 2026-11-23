@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
+import { ReadBuffer } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { TripChangeIntentSchema } from "../src/domain/schemas.js";
 import { createChicTripStdioTransport, STDIO_MAX_BUFFER_BYTES } from "../src/mcp/stdio-transport.js";
@@ -102,6 +103,63 @@ describe("bounded stdio transport", () => {
       expect(h.errors).toEqual([]);
       expect(h.isClosed()).toBe(false);
       expect(h.messages).toEqual([{ jsonrpc: "2.0", id: 1, method: "ping" }]);
+    } finally { await h.close(); }
+  }, 30_000);
+
+  test("reads one 64 MiB message assembled from small fragments", () => {
+    const buffer = new ReadBuffer({ maxBufferSize: STDIO_MAX_BUFFER_BYTES });
+    const bytes = Buffer.alloc(STDIO_MAX_BUFFER_BYTES, 32);
+    const json = Buffer.from('{"jsonrpc":"2.0","method":"ping"}');
+    json.copy(bytes);
+    bytes[bytes.length - 1] = 10;
+    const started = performance.now();
+    const fragment = 16 * 1024;
+    for (let offset = 0; offset < bytes.length; offset += fragment) {
+      buffer.append(bytes.subarray(offset, offset + fragment));
+    }
+    const message = buffer.readMessage();
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(message).toEqual({ jsonrpc: "2.0", method: "ping" });
+    expect(buffer.readMessage()).toBeNull();
+  }, 30_000);
+
+  test("keeps valid messages when the same chunk contains an oversized line", () => {
+    const limit = 128;
+    const buffer = new ReadBuffer({ maxBufferSize: limit });
+    const valid = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+    expect(valid.length).toBeLessThan(limit);
+    const oversized = Buffer.alloc(limit + 1, 32);
+    oversized[oversized.length - 1] = 10;
+    const after = Buffer.from('{"jsonrpc":"2.0","id":2,"method":"ping"}\n');
+    let caught: unknown;
+    try {
+      buffer.append(Buffer.concat([valid, oversized, after]));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain(`exceeded maximum size of ${limit} bytes`);
+    expect(buffer.readMessage()).toEqual({ jsonrpc: "2.0", id: 1, method: "ping" });
+    expect(buffer.readMessage()).toEqual({ jsonrpc: "2.0", id: 2, method: "ping" });
+    expect(buffer.readMessage()).toBeNull();
+  });
+
+  test("delivers a valid message when the same chunk ends with an oversized line", async () => {
+    const h = await harness();
+    try {
+      const first = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+      const oversized = Buffer.alloc(STDIO_MAX_BUFFER_BYTES + 1, 32);
+      oversized[oversized.length - 1] = 10;
+      const second = Buffer.from('{"jsonrpc":"2.0","id":2,"method":"ping"}\n');
+      h.input.write(Buffer.concat([first, oversized, second]));
+      expect(h.messages).toEqual([
+        { jsonrpc: "2.0", id: 1, method: "ping" },
+        { jsonrpc: "2.0", id: 2, method: "ping" },
+      ]);
+      expect(h.isClosed()).toBe(true);
+      expect(h.errors).toHaveLength(1);
+      expect(h.errors[0]?.message).toContain("exceeded maximum size of 67108864 bytes");
+      expect(h.input.listenerCount("data")).toBe(0);
     } finally { await h.close(); }
   }, 30_000);
 

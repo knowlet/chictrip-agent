@@ -21721,39 +21721,119 @@ var STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
 class ReadBuffer {
   constructor(options) {
     this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
+    this._chunks = [];
+    this._length = 0;
+    this._pending = 0;
   }
   append(chunk) {
-    const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
-    let lineStart = 0;
-    while (lineStart < combined.length) {
-      const newlineIndex = combined.indexOf(10, lineStart);
-      const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
-      if (lineEnd - lineStart > this._maxBufferSize) {
-        this.clear();
-        throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+    if (!Buffer.isBuffer(chunk))
+      chunk = Buffer.from(chunk);
+    if (chunk.length === 0)
+      return;
+    let cursor = 0;
+    let pending = this._pending;
+    let keepFrom = 0;
+    let overflow = false;
+    while (cursor < chunk.length) {
+      const newline = chunk.indexOf(10, cursor);
+      const unterminated = newline === -1;
+      const lineEnd = unterminated ? chunk.length : newline + 1;
+      const lineBytes = pending + (lineEnd - cursor);
+      if (lineBytes > this._maxBufferSize) {
+        this._discardPending();
+        if (cursor > keepFrom)
+          this._push(chunk.subarray(keepFrom, cursor));
+        overflow = true;
+        pending = 0;
+        if (unterminated) {
+          keepFrom = chunk.length;
+          break;
+        }
+        cursor = lineEnd;
+        keepFrom = lineEnd;
+        continue;
       }
-      if (newlineIndex === -1) {
+      if (unterminated) {
+        pending = lineBytes;
         break;
       }
-      lineStart = lineEnd;
+      pending = 0;
+      cursor = lineEnd;
     }
-    this._buffer = combined;
+    if (keepFrom < chunk.length)
+      this._push(chunk.subarray(keepFrom));
+    this._pending = pending;
+    if (overflow) {
+      throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
+    }
   }
   readMessage() {
-    if (!this._buffer) {
+    if (this._length === 0 || this._pending === this._length)
       return null;
+    let seen = 0;
+    let newlineAt = -1;
+    for (let index = 0;index < this._chunks.length; index++) {
+      const newline = this._chunks[index].indexOf(10);
+      if (newline !== -1) {
+        newlineAt = seen + newline;
+        break;
+      }
+      seen += this._chunks[index].length;
     }
-    const index = this._buffer.indexOf(`
-`);
-    if (index === -1) {
+    if (newlineAt === -1)
       return null;
-    }
-    const line = this._buffer.toString("utf8", 0, index).replace(/\r$/, "");
-    this._buffer = this._buffer.subarray(index + 1);
+    const taken = this._take(newlineAt + 1);
+    let line = taken.toString("utf8", 0, newlineAt);
+    if (line.endsWith("\r"))
+      line = line.slice(0, -1);
     return deserializeMessage(line);
   }
   clear() {
-    this._buffer = undefined;
+    this._chunks = [];
+    this._length = 0;
+    this._pending = 0;
+  }
+  _push(chunk) {
+    if (chunk.length === 0)
+      return;
+    this._chunks.push(chunk);
+    this._length += chunk.length;
+  }
+  _discardPending() {
+    let drop = this._pending;
+    if (drop === 0)
+      return;
+    this._length -= drop;
+    while (drop > 0 && this._chunks.length > 0) {
+      const last = this._chunks.pop();
+      if (last.length <= drop) {
+        drop -= last.length;
+      } else {
+        this._chunks.push(last.subarray(0, last.length - drop));
+        drop = 0;
+      }
+    }
+    this._pending = 0;
+  }
+  _take(byteCount) {
+    const parts = [];
+    let need = byteCount;
+    while (need > 0) {
+      const chunk = this._chunks[0];
+      if (chunk.length <= need) {
+        parts.push(chunk);
+        need -= chunk.length;
+        this._chunks.shift();
+      } else {
+        parts.push(chunk.subarray(0, need));
+        this._chunks[0] = chunk.subarray(need);
+        need = 0;
+      }
+    }
+    this._length -= byteCount;
+    if (parts.length === 1)
+      return parts[0];
+    return Buffer.concat(parts, byteCount);
   }
 }
 function deserializeMessage(line) {
@@ -21771,11 +21851,15 @@ class StdioServerTransport {
     this._stdout = _stdout;
     this._started = false;
     this._ondata = (chunk) => {
+      let overflow;
       try {
         this._readBuffer.append(chunk);
-        this.processReadBuffer();
       } catch (error51) {
-        this.onerror?.(error51);
+        overflow = error51;
+      }
+      this.processReadBuffer();
+      if (overflow) {
+        this.onerror?.(overflow);
         this.close().catch(() => {});
       }
     };
@@ -32197,4 +32281,4 @@ process.once("SIGTERM", () => {
   shutdown();
 });
 
-//# debugId=5626330776EE79DF64756E2164756E21
+//# debugId=570C7885E7BDE05164756E2164756E21

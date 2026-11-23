@@ -1,70 +1,381 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/.bun-tag-f9906267995c0bcd b/.bun-tag-f9906267995c0bcd
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/cjs/client/stdio.js b/dist/cjs/client/stdio.js
+index aabab78421a9b2e3981cf2ca138ea33494603a26..2156b87aeb2564f14351e7d81ba8e39996853b1a 100644
+--- a/dist/cjs/client/stdio.js
++++ b/dist/cjs/client/stdio.js
+@@ -95,12 +95,17 @@ class StdioClientTransport {
+                 this.onerror?.(error);
+             });
+             this._process.stdout?.on('data', chunk => {
++                let overflow;
+                 try {
+                     this._readBuffer.append(chunk);
+-                    this.processReadBuffer();
+                 }
+                 catch (error) {
+-                    this.onerror?.(error);
++                    overflow = error;
++                }
++                // Deliver messages accepted before an oversized line in this chunk.
++                this.processReadBuffer();
++                if (overflow) {
++                    this.onerror?.(overflow);
+                     this.close().catch(() => { });
+                 }
+             });
+diff --git a/dist/cjs/server/stdio.js b/dist/cjs/server/stdio.js
+index 58946c6f35dffcf1ed9f07cfb9ff5fa11b066483..446e5394a612796613c7bf66045c689320959b85 100644
+--- a/dist/cjs/server/stdio.js
++++ b/dist/cjs/server/stdio.js
+@@ -18,12 +18,17 @@ class StdioServerTransport {
+         this._started = false;
+         // Arrow functions to bind `this` properly, while maintaining function identity.
+         this._ondata = (chunk) => {
++            let overflow;
+             try {
+                 this._readBuffer.append(chunk);
+-                this.processReadBuffer();
+             }
+             catch (error) {
+-                this.onerror?.(error);
++                overflow = error;
++            }
++            // Deliver messages accepted before an oversized line in this chunk.
++            this.processReadBuffer();
++            if (overflow) {
++                this.onerror?.(overflow);
+                 this.close().catch(() => { });
+             }
+         };
 diff --git a/dist/cjs/shared/stdio.js b/dist/cjs/shared/stdio.js
-index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..9846619b4fdbc3859e0c38ddb053aa97190b9666 100644
+index 94dad1ed8dc8f430966bf191b2a33003e6144d0d..0c5e4eed2bf2d9808a37803213aebcffebe278d8 100644
 --- a/dist/cjs/shared/stdio.js
 +++ b/dist/cjs/shared/stdio.js
-@@ -13,12 +13,25 @@ class ReadBuffer {
+@@ -11,29 +11,125 @@ exports.STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+ class ReadBuffer {
+     constructor(options) {
          this._maxBufferSize = options?.maxBufferSize ?? exports.STDIO_DEFAULT_MAX_BUFFER_SIZE;
++        this._chunks = [];
++        this._length = 0;
++        // Bytes after the last newline. Complete messages already stored are not included.
++        this._pending = 0;
      }
      append(chunk) {
 -        const newSize = (this._buffer?.length ?? 0) + chunk.length;
 -        if (newSize > this._maxBufferSize) {
 -            this.clear();
--            throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
-+        const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
-+        // Count each newline-delimited message (bytes since the previous
-+        // newline, including that message's terminating newline), not the
-+        // whole incoming chunk. A chunk may finish one in-limit message and
-+        // begin the next.
-+        let lineStart = 0;
-+        while (lineStart < combined.length) {
-+            const newlineIndex = combined.indexOf(10, lineStart);
-+            const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
-+            if (lineEnd - lineStart > this._maxBufferSize) {
-+                this.clear();
-+                throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++        if (!Buffer.isBuffer(chunk))
++            chunk = Buffer.from(chunk);
++        if (chunk.length === 0)
++            return;
++        // Keep the incoming pieces and copy them once, when a message is read.
++        // The limit is bytes since the previous newline, including that
++        // message's terminating newline.
++        let cursor = 0;
++        let pending = this._pending;
++        let keepFrom = 0;
++        let overflow = false;
++        while (cursor < chunk.length) {
++            const newline = chunk.indexOf(10, cursor);
++            const unterminated = newline === -1;
++            const lineEnd = unterminated ? chunk.length : newline + 1;
++            const lineBytes = pending + (lineEnd - cursor);
++            if (lineBytes > this._maxBufferSize) {
++                this._discardPending();
++                if (cursor > keepFrom)
++                    this._push(chunk.subarray(keepFrom, cursor));
++                overflow = true;
++                pending = 0;
++                if (unterminated) {
++                    keepFrom = chunk.length;
++                    break;
++                }
++                cursor = lineEnd;
++                keepFrom = lineEnd;
++                continue;
 +            }
-+            if (newlineIndex === -1) {
++            if (unterminated) {
++                pending = lineBytes;
 +                break;
 +            }
-+            lineStart = lineEnd;
++            pending = 0;
++            cursor = lineEnd;
++        }
++        if (keepFrom < chunk.length)
++            this._push(chunk.subarray(keepFrom));
++        this._pending = pending;
++        if (overflow) {
+             throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
          }
 -        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
-+        this._buffer = combined;
      }
      readMessage() {
-         if (!this._buffer) {
+-        if (!this._buffer) {
++        if (this._length === 0 || this._pending === this._length)
+             return null;
++        let seen = 0;
++        let newlineAt = -1;
++        for (let index = 0; index < this._chunks.length; index++) {
++            const newline = this._chunks[index].indexOf(10);
++            if (newline !== -1) {
++                newlineAt = seen + newline;
++                break;
++            }
++            seen += this._chunks[index].length;
+         }
+-        const index = this._buffer.indexOf('\n');
+-        if (index === -1) {
++        if (newlineAt === -1)
+             return null;
+-        }
+-        const line = this._buffer.toString('utf8', 0, index).replace(/\r$/, '');
+-        this._buffer = this._buffer.subarray(index + 1);
++        const taken = this._take(newlineAt + 1);
++        let line = taken.toString('utf8', 0, newlineAt);
++        if (line.endsWith('\r'))
++            line = line.slice(0, -1);
+         return deserializeMessage(line);
+     }
+     clear() {
+-        this._buffer = undefined;
++        this._chunks = [];
++        this._length = 0;
++        this._pending = 0;
++    }
++    _push(chunk) {
++        if (chunk.length === 0)
++            return;
++        this._chunks.push(chunk);
++        this._length += chunk.length;
++    }
++    _discardPending() {
++        let drop = this._pending;
++        if (drop === 0)
++            return;
++        this._length -= drop;
++        while (drop > 0 && this._chunks.length > 0) {
++            const last = this._chunks.pop();
++            if (last.length <= drop) {
++                drop -= last.length;
++            }
++            else {
++                this._chunks.push(last.subarray(0, last.length - drop));
++                drop = 0;
++            }
++        }
++        this._pending = 0;
++    }
++    _take(byteCount) {
++        const parts = [];
++        let need = byteCount;
++        while (need > 0) {
++            const chunk = this._chunks[0];
++            if (chunk.length <= need) {
++                parts.push(chunk);
++                need -= chunk.length;
++                this._chunks.shift();
++            }
++            else {
++                parts.push(chunk.subarray(0, need));
++                this._chunks[0] = chunk.subarray(need);
++                need = 0;
++            }
++        }
++        this._length -= byteCount;
++        if (parts.length === 1)
++            return parts[0];
++        return Buffer.concat(parts, byteCount);
+     }
+ }
+ exports.ReadBuffer = ReadBuffer;
+diff --git a/dist/esm/client/stdio.js b/dist/esm/client/stdio.js
+index 925ad2160eebfe8bc7390a889d850ba547c494fa..70a37a46904697af36544562f6b6773de893135d 100644
+--- a/dist/esm/client/stdio.js
++++ b/dist/esm/client/stdio.js
+@@ -88,12 +88,17 @@ export class StdioClientTransport {
+                 this.onerror?.(error);
+             });
+             this._process.stdout?.on('data', chunk => {
++                let overflow;
+                 try {
+                     this._readBuffer.append(chunk);
+-                    this.processReadBuffer();
+                 }
+                 catch (error) {
+-                    this.onerror?.(error);
++                    overflow = error;
++                }
++                // Deliver messages accepted before an oversized line in this chunk.
++                this.processReadBuffer();
++                if (overflow) {
++                    this.onerror?.(overflow);
+                     this.close().catch(() => { });
+                 }
+             });
+diff --git a/dist/esm/server/stdio.js b/dist/esm/server/stdio.js
+index 76e877ede5f84d172e1ced16be24845112fc152c..ccd2e4780ea2d5739f37a843b613edc7ec2e7518 100644
+--- a/dist/esm/server/stdio.js
++++ b/dist/esm/server/stdio.js
+@@ -12,12 +12,17 @@ export class StdioServerTransport {
+         this._started = false;
+         // Arrow functions to bind `this` properly, while maintaining function identity.
+         this._ondata = (chunk) => {
++            let overflow;
+             try {
+                 this._readBuffer.append(chunk);
+-                this.processReadBuffer();
+             }
+             catch (error) {
+-                this.onerror?.(error);
++                overflow = error;
++            }
++            // Deliver messages accepted before an oversized line in this chunk.
++            this.processReadBuffer();
++            if (overflow) {
++                this.onerror?.(overflow);
+                 this.close().catch(() => { });
+             }
+         };
 diff --git a/dist/esm/shared/stdio.js b/dist/esm/shared/stdio.js
-index cf20e652c2f8fb6444559e8dae7dc259b310acd6..d5da589b4d209fd8dab33ff01914a873dc6c7aab 100644
+index cf20e652c2f8fb6444559e8dae7dc259b310acd6..e1ed9d48e27fb2d88c0d448321b6477d9dc71164 100644
 --- a/dist/esm/shared/stdio.js
 +++ b/dist/esm/shared/stdio.js
-@@ -8,12 +8,25 @@ export class ReadBuffer {
+@@ -6,29 +6,125 @@ export const STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+ export class ReadBuffer {
+     constructor(options) {
          this._maxBufferSize = options?.maxBufferSize ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
++        this._chunks = [];
++        this._length = 0;
++        // Bytes after the last newline. Complete messages already stored are not included.
++        this._pending = 0;
      }
      append(chunk) {
 -        const newSize = (this._buffer?.length ?? 0) + chunk.length;
 -        if (newSize > this._maxBufferSize) {
 -            this.clear();
--            throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
-+        const combined = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
-+        // Count each newline-delimited message (bytes since the previous
-+        // newline, including that message's terminating newline), not the
-+        // whole incoming chunk. A chunk may finish one in-limit message and
-+        // begin the next.
-+        let lineStart = 0;
-+        while (lineStart < combined.length) {
-+            const newlineIndex = combined.indexOf(10, lineStart);
-+            const lineEnd = newlineIndex === -1 ? combined.length : newlineIndex + 1;
-+            if (lineEnd - lineStart > this._maxBufferSize) {
-+                this.clear();
-+                throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
++        if (!Buffer.isBuffer(chunk))
++            chunk = Buffer.from(chunk);
++        if (chunk.length === 0)
++            return;
++        // Keep the incoming pieces and copy them once, when a message is read.
++        // The limit is bytes since the previous newline, including that
++        // message's terminating newline.
++        let cursor = 0;
++        let pending = this._pending;
++        let keepFrom = 0;
++        let overflow = false;
++        while (cursor < chunk.length) {
++            const newline = chunk.indexOf(10, cursor);
++            const unterminated = newline === -1;
++            const lineEnd = unterminated ? chunk.length : newline + 1;
++            const lineBytes = pending + (lineEnd - cursor);
++            if (lineBytes > this._maxBufferSize) {
++                this._discardPending();
++                if (cursor > keepFrom)
++                    this._push(chunk.subarray(keepFrom, cursor));
++                overflow = true;
++                pending = 0;
++                if (unterminated) {
++                    keepFrom = chunk.length;
++                    break;
++                }
++                cursor = lineEnd;
++                keepFrom = lineEnd;
++                continue;
 +            }
-+            if (newlineIndex === -1) {
++            if (unterminated) {
++                pending = lineBytes;
 +                break;
 +            }
-+            lineStart = lineEnd;
++            pending = 0;
++            cursor = lineEnd;
++        }
++        if (keepFrom < chunk.length)
++            this._push(chunk.subarray(keepFrom));
++        this._pending = pending;
++        if (overflow) {
+             throw new Error(`ReadBuffer exceeded maximum size of ${this._maxBufferSize} bytes`);
          }
 -        this._buffer = this._buffer ? Buffer.concat([this._buffer, chunk]) : chunk;
-+        this._buffer = combined;
      }
      readMessage() {
-         if (!this._buffer) {
+-        if (!this._buffer) {
++        if (this._length === 0 || this._pending === this._length)
+             return null;
++        let seen = 0;
++        let newlineAt = -1;
++        for (let index = 0; index < this._chunks.length; index++) {
++            const newline = this._chunks[index].indexOf(10);
++            if (newline !== -1) {
++                newlineAt = seen + newline;
++                break;
++            }
++            seen += this._chunks[index].length;
+         }
+-        const index = this._buffer.indexOf('\n');
+-        if (index === -1) {
++        if (newlineAt === -1)
+             return null;
+-        }
+-        const line = this._buffer.toString('utf8', 0, index).replace(/\r$/, '');
+-        this._buffer = this._buffer.subarray(index + 1);
++        const taken = this._take(newlineAt + 1);
++        let line = taken.toString('utf8', 0, newlineAt);
++        if (line.endsWith('\r'))
++            line = line.slice(0, -1);
+         return deserializeMessage(line);
+     }
+     clear() {
+-        this._buffer = undefined;
++        this._chunks = [];
++        this._length = 0;
++        this._pending = 0;
++    }
++    _push(chunk) {
++        if (chunk.length === 0)
++            return;
++        this._chunks.push(chunk);
++        this._length += chunk.length;
++    }
++    _discardPending() {
++        let drop = this._pending;
++        if (drop === 0)
++            return;
++        this._length -= drop;
++        while (drop > 0 && this._chunks.length > 0) {
++            const last = this._chunks.pop();
++            if (last.length <= drop) {
++                drop -= last.length;
++            }
++            else {
++                this._chunks.push(last.subarray(0, last.length - drop));
++                drop = 0;
++            }
++        }
++        this._pending = 0;
++    }
++    _take(byteCount) {
++        const parts = [];
++        let need = byteCount;
++        while (need > 0) {
++            const chunk = this._chunks[0];
++            if (chunk.length <= need) {
++                parts.push(chunk);
++                need -= chunk.length;
++                this._chunks.shift();
++            }
++            else {
++                parts.push(chunk.subarray(0, need));
++                this._chunks[0] = chunk.subarray(need);
++                need = 0;
++            }
++        }
++        this._length -= byteCount;
++        if (parts.length === 1)
++            return parts[0];
++        return Buffer.concat(parts, byteCount);
+     }
+ }
+ export function deserializeMessage(line) {
